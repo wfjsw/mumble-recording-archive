@@ -1,4 +1,5 @@
 pub mod bot;
+pub mod codec;
 pub mod config;
 pub mod export;
 pub mod live;
@@ -6,6 +7,8 @@ pub mod mumble;
 pub mod ogg;
 pub mod opus;
 pub mod pack;
+pub mod recorder;
+pub mod reorder;
 pub mod store;
 pub mod transcode;
 pub mod zipstream;

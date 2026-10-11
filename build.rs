@@ -1,6 +1,12 @@
 fn main() {
     println!("cargo:rerun-if-changed=proto/Mumble.proto");
-    prost_build::Config::new()
+    println!("cargo:rerun-if-env-changed=PROTOC");
+    let mut config = prost_build::Config::new();
+    if std::env::var_os("PROTOC").is_none() {
+        let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
+        config.protoc_executable(protoc);
+    }
+    config
         .compile_protos(&["proto/Mumble.proto"], &["proto/"])
-        .expect("compile Mumble.proto (protoc must be on PATH or set PROTOC)");
+        .expect("compile Mumble.proto");
 }

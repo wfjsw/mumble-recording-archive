@@ -38,9 +38,14 @@ impl<W: Write> OggOpusWriter<W> {
     }
 
     pub fn with_pre_skip(w: W, serial: u32, vendor: &str, pre_skip: u16) -> io::Result<Self> {
+        Self::with_head(w, serial, vendor, 1, pre_skip)
+    }
+
+    /// Mono/stereo stream (mapping family 0) with the given pre-skip.
+    pub fn with_head(w: W, serial: u32, vendor: &str, channels: u8, pre_skip: u16) -> io::Result<Self> {
         let mut head = b"OpusHead".to_vec();
         head.push(1); // version
-        head.push(1); // channels
+        head.push(channels);
         head.extend_from_slice(&pre_skip.to_le_bytes()); // 0 for live pass-through packets
         head.extend_from_slice(&48_000u32.to_le_bytes());
         head.extend_from_slice(&0i16.to_le_bytes());
@@ -184,6 +189,5 @@ mod tests {
         }
         let buf = w.finish().unwrap();
         assert_eq!(last_granule(&buf[..]).unwrap(), 48_000);
-        // known vector: CRC of "OggS" page header check is exercised by ffmpeg in integration tests
     }
 }

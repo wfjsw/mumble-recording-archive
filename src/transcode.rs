@@ -2,19 +2,19 @@
 //! stream is decoded, split into speech regions (silence is not stored),
 //! re-encoded to compact VBR speech Opus (never above the source bitrate) and
 //! appended to a day pack, plus a coarse peak envelope for waveform display.
+//! All codec work is in-process (libopus) on blocking worker threads.
 
 use crate::bot::now_ms;
+use crate::codec::{self, SpeechEncoder};
 use crate::config::Config;
 use crate::live::Live;
 use crate::ogg;
 use crate::opus;
 use crate::pack::Record;
 use crate::store::{Part, Segment, Store};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
 
 /// Stored waveform envelope resolution (<1% of the audio size); the UI draws
@@ -26,17 +26,6 @@ pub struct Transcoder {
     pub store: Arc<Store>,
     pub live: Arc<Live>,
     pub pack_lock: std::sync::Mutex<()>,
-}
-
-pub fn ffmpeg_cmd(cfg: &Config) -> tokio::process::Command {
-    let mut c = tokio::process::Command::new(&cfg.recording.ffmpeg);
-    c.args(["-hide_banner", "-nostdin", "-loglevel", "error"]);
-    c.kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    c
 }
 
 impl Transcoder {
@@ -69,8 +58,8 @@ impl Transcoder {
         while let Some(id) = rx.recv().await {
             let permit = sem.clone().acquire_owned().await.unwrap();
             let me = self.clone();
-            tokio::spawn(async move {
-                if let Err(e) = me.process(id).await {
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = me.process(id) {
                     tracing::error!("transcode segment {id}: {e:#}");
                 }
                 drop(permit);
@@ -78,7 +67,7 @@ impl Transcoder {
         }
     }
 
-    async fn process(&self, id: i64) -> Result<()> {
+    fn process(&self, id: i64) -> Result<()> {
         let Some(seg) = self.store.segment(id)? else { return Ok(()) };
         if seg.status != "raw" {
             return Ok(());
@@ -89,7 +78,7 @@ impl Transcoder {
             self.store.delete_segment(id)?;
             return Ok(());
         }
-        let ids = match self.store_regions(&seg, &raw).await {
+        let ids = match self.store_regions(&seg, &raw) {
             Ok(ids) => {
                 if !self.cfg.recording.keep_raw {
                     let _ = std::fs::remove_file(&raw);
@@ -111,11 +100,11 @@ impl Transcoder {
 
     /// Decode the burst, find its speech regions and store each region as a pack
     /// record: re-encoded, or the original packets if the source is already small.
-    async fn store_regions(&self, seg: &Segment, raw: &Path) -> Result<Vec<i64>> {
+    fn store_regions(&self, seg: &Segment, raw: &Path) -> Result<Vec<i64>> {
         let rc = &self.cfg.recording;
-        let raw_bytes = tokio::fs::read(raw).await?;
+        let raw_bytes = std::fs::read(raw)?;
         let src_packets = ogg::read_opus_packets(&raw_bytes);
-        let pcm = decode_file(&self.cfg, raw).await?;
+        let pcm = codec::decode_packets(&src_packets, 0, None)?;
         if pcm.is_empty() || src_packets.is_empty() {
             bail!("no audio decoded");
         }
@@ -150,6 +139,7 @@ impl Transcoder {
             packets: Vec<Vec<u8>>,
         }
         let mut out: Vec<Region> = vec![];
+        let mut encoder: Option<Result<SpeechEncoder>> = None;
         for (a, b) in regions {
             let r = if passthrough {
                 // Widen the region to whole source packets.
@@ -157,7 +147,8 @@ impl Transcoder {
                 let j = bounds.partition_point(|&x| x < b).min(src_packets.len());
                 Region { a: bounds[i], b: bounds[j].min(total), pre_skip: 0, packets: src_packets[i..j].to_vec() }
             } else {
-                let (pre_skip, packets) = self.encode_pcm(&pcm[a..b]).await?;
+                let encoder = encoder.get_or_insert_with(|| SpeechEncoder::new(self.cfg.target_bps()));
+                let (pre_skip, packets) = encoder.as_mut().map_err(|e| anyhow::anyhow!("{e:#}"))?.encode(&pcm[a..b])?;
                 Region { a, b, pre_skip: pre_skip as u64, packets }
             };
             if !r.packets.is_empty() && r.b > r.a {
@@ -234,49 +225,6 @@ impl Transcoder {
         f.sync_data()?;
         Ok(offsets)
     }
-
-    /// Encode mono 48 kHz PCM to Opus packets with speech-tuned VBR settings.
-    async fn encode_pcm(&self, pcm: &[f32]) -> Result<(u16, Vec<Vec<u8>>)> {
-        let rc = &self.cfg.recording;
-        let mut cmd = ffmpeg_cmd(&self.cfg);
-        cmd.args(["-f", "f32le", "-ar", "48000", "-ch_layout", "mono", "-i", "pipe:0"]);
-        cmd.args(["-c:a", "libopus", "-b:a", &rc.bitrate, "-vbr", "on", "-application", "voip", "-compression_level", "10"]);
-        // 120 ms frames: least per-packet overhead; latency is irrelevant for storage.
-        cmd.args(["-frame_duration", "120", "-fflags", "+bitexact", "-flags:a", "+bitexact", "-f", "ogg", "pipe:1"]);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().with_context(|| format!("spawn {}", rc.ffmpeg))?;
-        let mut stdin = child.stdin.take().unwrap();
-        let bytes: Vec<u8> = pcm.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let feeder = tokio::spawn(async move {
-            let _ = stdin.write_all(&bytes).await;
-        });
-        let mut stderr = child.stderr.take().unwrap();
-        let err_task = tokio::spawn(async move {
-            let mut s = String::new();
-            let _ = stderr.read_to_string(&mut s).await;
-            s
-        });
-        let mut out = vec![];
-        child.stdout.take().unwrap().read_to_end(&mut out).await?;
-        let _ = feeder.await;
-        let status = child.wait().await?;
-        if !status.success() {
-            bail!("ffmpeg encode failed ({status}): {}", err_task.await.unwrap_or_default().trim());
-        }
-        Ok((ogg::opus_pre_skip(&out), ogg::read_opus_packets(&out)))
-    }
-}
-
-/// Decode a (pass-through) Ogg Opus file to mono f32 @ 48 kHz.
-async fn decode_file(cfg: &Config, path: &Path) -> Result<Vec<f32>> {
-    let mut cmd = ffmpeg_cmd(cfg);
-    cmd.arg("-i").arg(path).args(["-f", "f32le", "-ac", "1", "-ar", "48000", "pipe:1"]);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
-    let out = cmd.output().await.with_context(|| format!("spawn {}", cfg.recording.ffmpeg))?;
-    if !out.status.success() {
-        bail!("ffmpeg decode failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(out.stdout.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
 }
 
 /// Sample ranges containing speech: 10 ms frames whose peak exceeds the

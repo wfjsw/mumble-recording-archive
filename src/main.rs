@@ -10,7 +10,7 @@ const USAGE: &str = "usage:
   mumble-archive [--config config.toml]                 run the recording bot
   mumble-archive republish [--config config.toml]       rebuild all static index files
   mumble-archive export --from <time> --to <time> --out <file>
-        [--layout downmix|tracks|channels|stems] [--format wav|flac|opus|mp3]
+        [--layout downmix|tracks|channels|stems] [--format wav|flac|opus]
         [--channels 1,2] [--speakers 3,4] [--config config.toml]
       <time> is unix ms or local 'YYYY-MM-DD HH:MM[:SS]'";
 
@@ -44,11 +44,6 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&cfg.recording.data_dir)?;
     std::fs::create_dir_all(cfg.public_dir())?;
 
-    // Fail early if ffmpeg is missing: every segment depends on it.
-    match std::process::Command::new(&cfg.recording.ffmpeg).arg("-version").output() {
-        Ok(o) if o.status.success() => {}
-        _ => bail!("ffmpeg not found at '{}' (set recording.ffmpeg)", cfg.recording.ffmpeg),
-    }
 
     let store = Arc::new(store::Store::open(&cfg.recording.data_dir.join("archive.db"))?);
     let live = Arc::new(live::Live::new());
@@ -76,6 +71,7 @@ async fn run(cfg: Arc<config::Config>, store: Arc<store::Store>, live: Arc<live:
         pack_lock: Default::default(),
     });
     transcoder.recover(&tx)?;
+    mumble_archive::recorder::recover_orphans(&cfg, &store, &tx)?;
     tokio::spawn(transcoder.run(rx));
     tokio::spawn(transcode::retention(cfg.clone(), store.clone(), live.clone()));
     publisher.rebuild(false)?;
@@ -86,7 +82,8 @@ async fn run(cfg: Arc<config::Config>, store: Arc<store::Store>, live: Arc<live:
         &cfg.data_path(&cfg.mumble.key_file),
         &cfg.mumble.username,
     )?;
-    let bot = Arc::new(bot::Bot { cfg: cfg.clone(), store, live, transcode: tx, identity });
+    let recorder = mumble_archive::recorder::Recorder::spawn(cfg.clone(), store.clone(), live.clone(), tx);
+    let bot = Arc::new(bot::Bot { cfg: cfg.clone(), store, live, recorder, identity });
     tracing::info!("publishing static files to {}", cfg.public_dir().display());
     tokio::select! {
         _ = bot.run() => {}

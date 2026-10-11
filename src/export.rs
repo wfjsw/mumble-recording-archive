@@ -1,19 +1,19 @@
-//! Export a time range: segments are decoded with ffmpeg, placed on a
-//! sample-accurate timeline and mixed into one or more output channels,
-//! then streamed out as WAV / FLAC / Opus / MP3, or as a zip of per-track stems.
+//! Export a time range: segments are decoded in-process (libopus), placed on a
+//! sample-accurate timeline and mixed into one or more output channels, then
+//! written as WAV / FLAC / Opus, or as a zip of per-track stems.
 
+use crate::codec::{self, ExportEncoder, EXPORT_FRAME};
 use crate::config::Config;
+use crate::ogg::OggOpusWriter;
 use crate::store::{Filter, Segment, Store};
-use crate::transcode::{ffmpeg_cmd, sanitize};
+use crate::transcode::sanitize;
 use crate::zipstream::ZipStream;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 const RATE: i64 = 48_000;
@@ -36,7 +36,6 @@ pub enum Format {
     Wav,
     Flac,
     Opus,
-    Mp3,
 }
 
 impl Layout {
@@ -57,8 +56,7 @@ impl Format {
             "wav" => Self::Wav,
             "flac" | "" => Self::Flac,
             "opus" | "ogg" => Self::Opus,
-            "mp3" => Self::Mp3,
-            _ => bail!("unknown format {s}"),
+            _ => bail!("unknown format {s} (wav, flac or opus)"),
         })
     }
     fn ext(self) -> &'static str {
@@ -66,7 +64,6 @@ impl Format {
             Self::Wav => "wav",
             Self::Flac => "flac",
             Self::Opus => "opus",
-            Self::Mp3 => "mp3",
         }
     }
     fn mime(self) -> &'static str {
@@ -74,15 +71,13 @@ impl Format {
             Self::Wav => "audio/wav",
             Self::Flac => "audio/flac",
             Self::Opus => "audio/ogg",
-            Self::Mp3 => "audio/mpeg",
         }
     }
     fn max_channels(self) -> usize {
         match self {
             Self::Wav => 256,
             Self::Flac => 8,
-            Self::Opus => 255,
-            Self::Mp3 => 2,
+            Self::Opus => 2,
         }
     }
 }
@@ -214,52 +209,29 @@ pub struct Output {
     pub body: mpsc::Receiver<Result<Bytes, std::io::Error>>,
 }
 
-/// Decode one segment to mono f32 @ 48 kHz.
-pub async fn decode(cfg: &Config, seg: &Segment) -> Result<Vec<f32>> {
-    let raw = decode_to(cfg, seg, &["-f", "f32le", "-ac", "1", "-ar", "48000"]).await?;
-    Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
-}
-
-/// Run ffmpeg over a segment's stored bytes (fed through stdin) with the given output args.
-pub async fn decode_to(cfg: &Config, seg: &Segment, out_args: &[&str]) -> Result<Vec<u8>> {
-    let dir = cfg.public_dir();
-    let s = seg.clone();
-    let data = tokio::task::spawn_blocking(move || Store::read_audio(&dir, &s)).await??;
-    let mut cmd = ffmpeg_cmd(cfg);
-    cmd.args(["-f", "ogg", "-i", "pipe:0"]).args(out_args).arg("pipe:1");
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::piped());
-    let mut child = cmd.spawn().context("spawn ffmpeg")?;
-    let mut stdin = child.stdin.take().unwrap();
-    let feeder = tokio::spawn(async move {
-        let _ = stdin.write_all(&data).await;
-    });
-    let mut raw = vec![];
-    child.stdout.take().unwrap().read_to_end(&mut raw).await?;
-    let _ = feeder.await;
-    let status = child.wait().await?;
-    if !status.success() && raw.is_empty() {
-        bail!("ffmpeg could not decode segment {}", seg.id);
-    }
-    Ok(raw)
-}
-
 /// Render interleaved f32 blocks for `nch` output channels.
 fn render(cfg: Arc<Config>, items: Vec<(Segment, usize, f32)>, nch: usize, from: i64, to: i64) -> mpsc::Receiver<Vec<f32>> {
     let (tx, rx) = mpsc::channel(4);
     tokio::spawn(async move {
         let total = ((to - from) * RATE / 1000) as usize;
-        let cfg2 = cfg.clone();
+        let dir = cfg.public_dir();
+        // Decode ahead on blocking threads, in start order.
         let mut decoded = futures::stream::iter(items.into_iter().map(move |(s, ch, g)| {
-            let cfg = cfg2.clone();
+            let dir = dir.clone();
             async move {
-                let pcm = match decode(&cfg, &s).await {
-                    Ok(p) => p,
+                let start = (s.start_ms - from) * RATE / 1000;
+                let id = s.id;
+                let pcm = match tokio::task::spawn_blocking(move || codec::decode_segment(&dir, &s)).await {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(e)) => {
+                        tracing::warn!("export: decode segment {id} failed: {e:#}");
+                        vec![]
+                    }
                     Err(e) => {
-                        tracing::warn!("export: decode segment {} failed: {e:#}", s.id);
+                        tracing::warn!("export: decode segment {id} failed: {e}");
                         vec![]
                     }
                 };
-                let start = (s.start_ms - from) * RATE / 1000;
                 (start, ch, g, pcm)
             }
         }))
@@ -315,6 +287,7 @@ fn wav_header(nch: usize, frames: u64) -> Vec<u8> {
     h.extend_from_slice(&16u16.to_le_bytes());
     h.extend_from_slice(&22u16.to_le_bytes());
     h.extend_from_slice(&16u16.to_le_bytes());
+    // channel mask: speaker positions for mono/stereo, unassigned for multitrack
     h.extend_from_slice(&(if nch == 1 { 4u32 } else if nch == 2 { 3 } else { 0 }).to_le_bytes());
     h.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71]);
     h.extend_from_slice(b"data");
@@ -330,90 +303,94 @@ fn to_s16(buf: &[f32]) -> Vec<u8> {
     out
 }
 
-fn encoder_args(format: Format, nch: usize) -> Vec<String> {
-    let v: Vec<&str> = match format {
-        Format::Flac => vec!["-c:a", "flac", "-compression_level", "5", "-f", "flac"],
-        Format::Mp3 => vec!["-c:a", "libmp3lame", "-q:a", "4", "-f", "mp3"],
-        Format::Opus => vec!["-c:a", "libopus", "-vbr", "on", "-application", "voip", "-f", "ogg"],
-        Format::Wav => vec![],
-    };
-    let mut v: Vec<String> = v.into_iter().map(String::from).collect();
-    if format == Format::Opus {
-        v.splice(0..0, ["-b:a".to_string(), format!("{}k", 32 * nch.max(1))]);
-        if nch > 2 {
-            v.splice(0..0, ["-mapping_family".to_string(), "255".to_string()]);
-        }
-    }
-    v
+/// flacenc input fed by the renderer (runs on a blocking thread).
+struct BlockSource {
+    rx: mpsc::Receiver<Vec<f32>>,
+    nch: usize,
+    buf: Vec<i32>,
+    pos: usize,
 }
 
-/// Encode f32 blocks with ffmpeg into a temp file (so containers get proper
-/// duration/seek headers), then hand the file to `sink` chunk by chunk.
+impl flacenc::source::Source for BlockSource {
+    fn channels(&self) -> usize {
+        self.nch
+    }
+    fn bits_per_sample(&self) -> usize {
+        16
+    }
+    fn sample_rate(&self) -> usize {
+        RATE as usize
+    }
+    fn read_samples<F: flacenc::source::Fill>(
+        &mut self,
+        block_size: usize,
+        dest: &mut F,
+    ) -> Result<usize, flacenc::error::SourceError> {
+        let want = block_size * self.nch;
+        while self.buf.len() - self.pos < want {
+            let Some(b) = self.rx.blocking_recv() else { break };
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+            self.buf.extend(b.iter().map(|v| (v * 32767.0).round() as i32));
+        }
+        let n = (self.buf.len() - self.pos).min(want) / self.nch * self.nch;
+        dest.fill_interleaved(&self.buf[self.pos..self.pos + n])?;
+        self.pos += n;
+        Ok(n / self.nch)
+    }
+}
+
+fn encode_flac(rx: mpsc::Receiver<Vec<f32>>, nch: usize) -> Result<Vec<u8>> {
+    use flacenc::component::BitRepr;
+    use flacenc::error::Verify;
+    let config = flacenc::config::Encoder::default().into_verified().map_err(|e| anyhow!("flac config: {e:?}"))?;
+    let src = BlockSource { rx, nch, buf: vec![], pos: 0 };
+    let stream =
+        flacenc::encode_with_fixed_block_size(&config, src, config.block_size).map_err(|e| anyhow!("flac encode: {e:?}"))?;
+    let mut sink = flacenc::bitsink::ByteSink::new();
+    stream.write(&mut sink).map_err(|e| anyhow!("flac write: {e:?}"))?;
+    Ok(sink.as_slice().to_vec())
+}
+
+async fn encode_opus(mut blocks: mpsc::Receiver<Vec<f32>>, nch: usize) -> Result<Vec<u8>> {
+    let mut enc = ExportEncoder::new(nch, 32_000 * nch as i32)?;
+    let mut w = OggOpusWriter::with_head(Vec::new(), rand_serial(), "mumble-archive", nch as u8, enc.pre_skip as u16)?;
+    let mut frames = 0i64;
+    while let Some(b) = blocks.recv().await {
+        frames += (b.len() / nch) as i64;
+        for p in enc.push(&b)? {
+            w.write_packet(&p, EXPORT_FRAME as i64)?;
+        }
+    }
+    for p in enc.finish()? {
+        w.write_packet(&p, EXPORT_FRAME as i64)?;
+    }
+    w.set_end_granule(enc.pre_skip as i64 + frames);
+    Ok(w.finish()?)
+}
+
+fn rand_serial() -> u32 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(1)
+}
+
+/// Encode rendered blocks as FLAC or Opus; the encoded bytes are passed to `sink`.
 async fn encode_stream(
-    cfg: &Config,
-    mut blocks: mpsc::Receiver<Vec<f32>>,
+    blocks: mpsc::Receiver<Vec<f32>>,
     nch: usize,
     format: Format,
-    meta: &[(String, String)],
     mut sink: impl FnMut(Bytes) -> futures::future::BoxFuture<'static, bool>,
 ) -> Result<()> {
-    let dir = cfg.recording.data_dir.join("tmp");
-    tokio::fs::create_dir_all(&dir).await?;
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp = TempFile(dir.join(format!(
-        "export-{}-{}.{}",
-        std::process::id(),
-        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        format.ext()
-    )));
-    let layout = match nch {
-        1 => "mono".to_string(),
-        2 => "stereo".to_string(),
-        n => format!("{n}c"), // unordered: tracks are not speaker positions
+    let data = match format {
+        Format::Flac => tokio::task::spawn_blocking(move || encode_flac(blocks, nch)).await??,
+        Format::Opus => encode_opus(blocks, nch).await?,
+        Format::Wav => bail!("WAV is written directly"),
     };
-    let mut cmd = ffmpeg_cmd(cfg);
-    cmd.args(["-y", "-f", "f32le", "-ar", "48000", "-ch_layout", &layout, "-i", "pipe:0"]);
-    for (k, v) in meta {
-        cmd.arg("-metadata").arg(format!("{k}={v}"));
-    }
-    cmd.args(encoder_args(format, nch)).arg(&tmp.0);
-    cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().context("spawn ffmpeg")?;
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let err_task = tokio::spawn(async move {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s).await;
-        s
-    });
-    while let Some(b) = blocks.recv().await {
-        let bytes: Vec<u8> = b.iter().flat_map(|v| v.to_le_bytes()).collect();
-        stdin.write_all(&bytes).await?;
-    }
-    drop(stdin);
-    let status = child.wait().await?;
-    if !status.success() {
-        bail!("ffmpeg encoder failed: {}", err_task.await.unwrap_or_default().trim());
-    }
-    let mut f = tokio::fs::File::open(&tmp.0).await?;
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = f.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        if !sink(Bytes::copy_from_slice(&buf[..n])).await {
-            bail!("client went away");
+    for chunk in data.chunks(256 * 1024) {
+        if !sink(Bytes::copy_from_slice(chunk)).await {
+            bail!("output closed");
         }
     }
     Ok(())
-}
-
-struct TempFile(std::path::PathBuf);
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
 }
 
 pub fn run(cfg: Arc<Config>, plan: Plan, format: Format, stems: bool) -> Output {
@@ -447,11 +424,9 @@ pub fn run(cfg: Arc<Config>, plan: Plan, format: Format, stems: bool) -> Output 
                             zip.write(to_s16(&b).into()).await?;
                         }
                     } else {
-                        let meta = vec![("title".to_string(), c.label.clone()), ("date".to_string(), date.clone())];
                         let (ctx, mut crx) = mpsc::channel::<Bytes>(8);
-                        let cfg = cfg.clone();
                         let enc = tokio::spawn(async move {
-                            encode_stream(&cfg, blocks, 1, format, &meta, move |b| {
+                            encode_stream(blocks, 1, format, move |b| {
                                 let ctx = ctx.clone();
                                 Box::pin(async move { ctx.send(b).await.is_ok() })
                             })
@@ -491,14 +466,8 @@ pub fn run(cfg: Arc<Config>, plan: Plan, format: Format, stems: bool) -> Output 
             }
             return;
         }
-        let labels = plan.channels.iter().map(|c| format!("{}={}", c.index + 1, c.label)).collect::<Vec<_>>().join("; ");
-        let meta = vec![
-            ("title".to_string(), plan.filename.clone()),
-            ("comment".to_string(), format!("channels: {labels}")),
-            ("date".to_string(), date),
-        ];
         let tx2 = tx.clone();
-        let res = encode_stream(&cfg, blocks, nch, format, &meta, move |b| {
+        let res = encode_stream(blocks, nch, format, move |b| {
             let tx = tx2.clone();
             Box::pin(async move { tx.send(Ok(b)).await.is_ok() })
         })

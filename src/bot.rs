@@ -8,15 +8,16 @@
 
 use crate::config::Config;
 use crate::live::Live;
+use crate::mumble::crypt::CryptState;
+use crate::mumble::udp::{UdpEvent, VoiceLink};
 use crate::mumble::{self, kind, pb, AudioPacket, Connection, Identity};
-use crate::ogg::OggOpusWriter;
 use crate::opus;
+use crate::recorder::{BurstMeta, Recorder};
+use crate::reorder::Reorder;
 use crate::store::Store;
 use anyhow::{bail, Result};
 use prost::Message;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufWriter;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -29,7 +30,7 @@ pub struct Bot {
     pub cfg: Arc<Config>,
     pub store: Arc<Store>,
     pub live: Arc<Live>,
-    pub transcode: mpsc::UnboundedSender<i64>,
+    pub recorder: Recorder,
     pub identity: Identity,
 }
 
@@ -51,8 +52,10 @@ struct UserInfo {
     flags: [bool; 5], // self_mute, mute, suppress, self_deaf, deaf
 }
 
+/// A burst being recorded. Pure in-memory bookkeeping: the audio itself is
+/// written by the recorder thread, so this loop never waits on disk.
 struct Stream {
-    seg_id: i64,
+    key: u64,
     speaker: i64,
     channel: i64,
     target: u8,
@@ -61,9 +64,6 @@ struct Stream {
     last_seq: i64,
     last_step: i64,
     last_arrival: i64,
-    last_db_update: i64,
-    raw_path: std::path::PathBuf,
-    writer: OggOpusWriter<BufWriter<File>>,
 }
 
 #[derive(Default)]
@@ -77,6 +77,16 @@ struct State {
     uptime: Option<i64>,
     last_rx: i64,
     warned_codec: bool,
+    /// Per-session reorder buffers in front of the segmenter.
+    reorder: HashMap<u32, Reorder>,
+    /// UDP key material from CryptSetup, until the link is started after sync.
+    crypt: Option<CryptState>,
+    udp: Option<VoiceLink>,
+    udp_events: Option<mpsc::UnboundedSender<UdpEvent>>,
+    tcp_packets: u32,
+    last_tick: i64,
+    /// Worst event-loop stall since the last stats line (ms).
+    max_lag: i64,
 }
 
 enum SplitReason {
@@ -105,10 +115,13 @@ impl Bot {
         let mut conn = Connection::connect(&m.address, m.tls_verify, &self.identity).await?;
         conn.handshake(&m.username, &m.password, &m.tokens, true).await?;
 
-        let mut st = State { last_rx: now_ms(), ..Default::default() };
+        let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<UdpEvent>();
+        let mut st = State { last_rx: now_ms(), udp_events: Some(udp_tx), ..Default::default() };
         let mut ping = tokio::time::interval(Duration::from_secs(10));
+        let mut udp_tick = tokio::time::interval(Duration::from_secs(5));
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+        let mut flush = tokio::time::interval(Duration::from_secs(1));
 
         let res: Result<()> = async {
             loop {
@@ -118,15 +131,52 @@ impl Bot {
                         st.last_rx = now_ms();
                         self.handle(&mut conn, &mut st, f).await?;
                     }
-                    _ = ping.tick() => {
-                        conn.send(kind::PING, &pb::Ping { timestamp: Some(now_ms() as u64), ..Default::default() }).await?;
+                    Some(ev) = udp_rx.recv() => {
+                        let now = now_ms();
+                        if let Some(link) = st.udp.as_mut() {
+                            link.on_event(&mut conn, &ev, now).await?;
+                        }
+                        if let UdpEvent::Voice(p) = ev {
+                            if let Some(pkt) = mumble::parse_server_audio(&p) {
+                                self.on_audio(&mut st, pkt, now);
+                            }
+                        }
                     }
+                    _ = udp_tick.tick() => {
+                        if let Some(link) = st.udp.as_mut() {
+                            link.tick(&mut conn, now_ms()).await?;
+                        }
+                    }
+                    _ = ping.tick() => {
+                        let mut p = pb::Ping { timestamp: Some(now_ms() as u64), tcp_packets: Some(st.tcp_packets), ..Default::default() };
+                        if let Some(link) = &st.udp {
+                            link.fill_ping(&mut p);
+                        }
+                        let (lost, late) = st.udp.as_ref().map_or((0, 0), |l| l.loss());
+                        tracing::debug!(
+                            "voice packets: tcp {}, udp {} (udp {}; lost {lost}, late {late}); reorder drops {}; {} streams; max loop lag {} ms",
+                            st.tcp_packets,
+                            st.udp.as_ref().map_or(0, |l| l.udp_packets),
+                            if st.udp.as_ref().is_some_and(|l| l.active()) { "active" } else { "inactive" },
+                            st.reorder.values().map(|r| r.dropped_late).sum::<u64>(),
+                            st.streams.len(),
+                            st.max_lag,
+                        );
+                        st.max_lag = 0;
+                        conn.send(kind::PING, &p).await?;
+                    }
+                    _ = flush.tick() => self.recorder.flush(),
                     _ = heartbeat.tick() => {
                         if let Some(id) = st.uptime { self.store.touch_uptime(id, now_ms())?; }
                     }
                     _ = tick.tick() => {
                         let now = now_ms();
+                        if st.last_tick > 0 {
+                            st.max_lag = st.max_lag.max(now - st.last_tick - 250);
+                        }
+                        st.last_tick = now;
                         if now - st.last_rx > 40_000 { bail!("server timed out"); }
+                        self.release_voice(&mut st, now);
                         self.expire_streams(&mut st, now);
                     }
                 }
@@ -140,6 +190,9 @@ impl Bot {
 
     fn teardown(&self, st: &mut State) {
         let now = now_ms();
+        for session in st.reorder.keys().copied().collect::<Vec<_>>() {
+            self.drain_voice(st, session);
+        }
         let sessions: Vec<u32> = st.streams.keys().copied().collect();
         for s in sessions {
             self.finalize(st, s);
@@ -159,7 +212,29 @@ impl Bot {
         match f.kind {
             kind::UDP_TUNNEL => {
                 if let Some(pkt) = mumble::parse_server_audio(&f.payload) {
+                    st.tcp_packets = st.tcp_packets.wrapping_add(1);
+                    if let Some(link) = st.udp.as_mut() {
+                        link.on_tcp_voice(now).await?;
+                    }
                     self.on_audio(st, pkt, now);
+                }
+            }
+            kind::CRYPT_SETUP => {
+                let m = pb::CryptSetup::decode(&f.payload[..])?;
+                match (&m.key, &m.client_nonce, &m.server_nonce) {
+                    (Some(k), Some(c), Some(s)) => {
+                        // (Re)keying: (re)start the UDP link once we are synced and muted.
+                        st.crypt = CryptState::new(k, c, s);
+                        st.udp = None;
+                        if st.synced {
+                            self.start_udp(conn, st, now).await;
+                        }
+                    }
+                    _ => {
+                        if let Some(link) = st.udp.as_mut() {
+                            link.on_crypt_setup(conn, &m).await?;
+                        }
+                    }
                 }
             }
             kind::SERVER_SYNC => {
@@ -195,6 +270,9 @@ impl Bot {
                     conn.send(kind::USER_STATE, &pb::UserState { session: Some(me), channel_id: Some(target), ..Default::default() })
                         .await?;
                 }
+                // Start UDP only now: activation sends a voice packet, which the
+                // server ignores because we just muted ourselves.
+                self.start_udp(conn, st, now).await;
             }
             kind::CHANNEL_STATE => {
                 let m = pb::ChannelState::decode(&f.payload[..])?;
@@ -231,6 +309,8 @@ impl Bot {
                 if st.self_session == Some(m.session) {
                     bail!("removed from server: {}", m.reason.unwrap_or_default());
                 }
+                self.drain_voice(st, m.session);
+                st.reorder.remove(&m.session);
                 self.finalize(st, m.session);
                 if let Some(u) = st.users.remove(&m.session) {
                     if let Some((p, _)) = u.presence {
@@ -348,7 +428,49 @@ impl Bot {
         Ok(())
     }
 
+    async fn start_udp(&self, conn: &mut Connection, st: &mut State, now: i64) {
+        if !self.cfg.mumble.udp {
+            return;
+        }
+        let (Some(crypt), Some(tx)) = (st.crypt.take(), st.udp_events.clone()) else { return };
+        match VoiceLink::start(conn, crypt, tx, now).await {
+            Ok(link) => st.udp = Some(link),
+            Err(e) => tracing::warn!("UDP unavailable, voice stays on TCP: {e:#}"),
+        }
+    }
+
+    /// Voice from either transport goes through the speaker's reorder buffer.
     fn on_audio(&self, st: &mut State, pkt: AudioPacket, now: i64) {
+        let session = pkt.session;
+        if !st.reorder.entry(session).or_default().push(pkt, now) {
+            return; // late or duplicate (UDP)
+        }
+        self.release_session(st, session, now);
+    }
+
+    fn release_session(&self, st: &mut State, session: u32, now: i64) {
+        while let Some(item) = st.reorder.get_mut(&session).and_then(|r| r.pop_ready(now)) {
+            self.on_packet(st, item.pkt, item.arrival);
+        }
+    }
+
+    /// Release packets that have waited long enough for missing predecessors.
+    fn release_voice(&self, st: &mut State, now: i64) {
+        let waiting: Vec<u32> = st.reorder.iter().filter(|(_, r)| !r.is_empty()).map(|(s, _)| *s).collect();
+        for session in waiting {
+            self.release_session(st, session, now);
+        }
+    }
+
+    fn drain_voice(&self, st: &mut State, session: u32) {
+        let items = st.reorder.get_mut(&session).map(|r| r.drain()).unwrap_or_default();
+        for item in items {
+            self.on_packet(st, item.pkt, item.arrival);
+        }
+    }
+
+    /// Segment one in-order packet; `now` is its arrival time.
+    fn on_packet(&self, st: &mut State, pkt: AudioPacket, now: i64) {
         if pkt.codec != mumble::CODEC_OPUS {
             if !st.warned_codec {
                 st.warned_codec = true;
@@ -382,7 +504,7 @@ impl Bot {
                 if s.channel != channel
                     || s.target != pkt.target
                     || s.speaker != speaker
-                    || pkt.sequence < s.last_seq
+                    || pkt.sequence < s.last_seq - 500
                     || now - expected_end > gap
                 {
                     SplitReason::Discontinuity
@@ -404,20 +526,21 @@ impl Bot {
             return;
         }
 
-        #[allow(clippy::map_entry)] // opening a stream does fallible I/O first
-        if !st.streams.contains_key(&pkt.session) {
-            let start = contiguous_start.unwrap_or(now - samples / opus::SAMPLES_PER_MS);
-            match self.open_stream(speaker, channel, pkt.session, pkt.target, start) {
-                Ok(s) => {
-                    st.streams.insert(pkt.session, s);
-                }
-                Err(e) => {
-                    tracing::error!("cannot open segment: {e:#}");
-                    return;
-                }
+        let s = st.streams.entry(pkt.session).or_insert_with(|| {
+            let start_ms = contiguous_start.unwrap_or(now - samples / opus::SAMPLES_PER_MS);
+            let meta = BurstMeta { speaker, channel, session: pkt.session, target: pkt.target, start_ms };
+            Stream {
+                key: self.recorder.open(meta),
+                speaker,
+                channel,
+                target: pkt.target,
+                start_ms,
+                samples: 0,
+                last_seq: 0,
+                last_step: 0,
+                last_arrival: now,
             }
-        }
-        let s = st.streams.get_mut(&pkt.session).unwrap();
+        });
 
         // Fill sender-side gaps (lost packets / DTX) with silence, as indicated by the sequence number.
         if s.samples > 0 {
@@ -427,16 +550,13 @@ impl Bot {
                 if missing <= gap * opus::SAMPLES_PER_MS {
                     for frame in opus::silence(missing) {
                         let n = opus::packet_samples(frame).unwrap();
-                        if s.writer.write_packet(frame, n).is_ok() {
-                            s.samples += n;
-                        }
+                        self.recorder.packet(s.key, frame, n);
+                        s.samples += n;
                     }
                 }
             }
         }
-        if let Err(e) = s.writer.write_packet(&pkt.opus, samples) {
-            tracing::error!("write segment {}: {e}", s.seg_id);
-        }
+        self.recorder.packet(s.key, &pkt.opus, samples);
         s.samples += samples;
         s.last_seq = pkt.sequence;
         s.last_step = (samples / 480).max(1);
@@ -447,67 +567,19 @@ impl Bot {
         }
     }
 
-    fn open_stream(&self, speaker: i64, channel: i64, session: u32, target: u8, start: i64) -> Result<Stream> {
-        let rel = format!("raw/{start}-{session}.opus");
-        let path = self.cfg.public_dir().join(&rel);
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        let seg_id = self.store.insert_segment(speaker, channel, session, target, start, &rel)?;
-        let f = BufWriter::new(File::create(&path)?);
-        let writer = OggOpusWriter::new(f, seg_id as u32, "mumble-archive passthrough")?;
-        Ok(Stream {
-            seg_id,
-            speaker,
-            channel,
-            target,
-            start_ms: start,
-            samples: 0,
-            last_seq: 0,
-            last_step: 0,
-            last_arrival: now_ms(),
-            last_db_update: now_ms(),
-            raw_path: path,
-            writer,
-        })
-    }
-
     fn expire_streams(&self, st: &mut State, now: i64) {
         let gap = self.cfg.recording.gap_ms;
         let expired: Vec<u32> = st.streams.iter().filter(|(_, s)| now - s.last_arrival > gap).map(|(k, _)| *k).collect();
         for s in expired {
             self.finalize(st, s);
         }
-        for s in st.streams.values_mut() {
-            if now - s.last_db_update >= 1000 {
-                s.last_db_update = now;
-                let _ = s.writer.flush();
-                let _ = self.store.update_segment_length(s.seg_id, s.start_ms + s.samples / opus::SAMPLES_PER_MS, s.samples);
-            }
-        }
     }
 
+    /// End a burst: the recorder thread finishes the file, stores the row and
+    /// queues it for transcoding (or discards it if too short).
     fn finalize(&self, st: &mut State, session: u32) {
-        let Some(s) = st.streams.remove(&session) else { return };
-        let seg_id = s.seg_id;
-        let dur_ms = s.samples / opus::SAMPLES_PER_MS;
-        let end = s.start_ms + dur_ms;
-        let path = s.raw_path.clone();
-        let res = s.writer.finish().map(drop);
-        if let Err(e) = res {
-            tracing::error!("finish segment {seg_id}: {e}");
+        if let Some(s) = st.streams.remove(&session) {
+            self.recorder.close(s.key);
         }
-        if dur_ms < self.cfg.recording.min_segment_ms {
-            let _ = std::fs::remove_file(&path);
-            let _ = self.store.delete_segment(seg_id);
-            return;
-        }
-        let size = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
-        if let Err(e) = self.store.finish_segment(seg_id, end, s.samples, size) {
-            tracing::error!("store segment {seg_id}: {e}");
-            return;
-        }
-        let _ = self.store.touch_speaker(s.speaker, end);
-        self.live.touch_speakers();
-        self.live.touch_day(s.start_ms);
-        let _ = self.transcode.send(seg_id);
     }
 }

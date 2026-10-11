@@ -444,39 +444,30 @@ impl Store {
 
     // ---- segments ----
 
-    pub fn insert_segment(&self, speaker: i64, channel: i64, session: u32, target: u8, start: i64, raw_path: &str) -> Result<i64> {
+    /// A complete burst waiting to be transcoded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_raw_segment(
+        &self,
+        speaker: i64,
+        channel: i64,
+        session: u32,
+        target: u8,
+        start: i64,
+        end: i64,
+        samples: i64,
+        raw_path: &str,
+        size: i64,
+    ) -> Result<i64> {
         let c = self.w();
         c.execute(
-            "INSERT INTO segments(speaker_id, channel_id, session, target, start_ms, end_ms, status, path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'recording', ?6)",
-            params![speaker, channel, session, target, start, raw_path],
+            "INSERT INTO segments(speaker_id, channel_id, session, target, start_ms, end_ms, samples, status, path, size, raw_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'raw', ?8, ?9, ?9)",
+            params![speaker, channel, session, target, start, end, samples, raw_path, size],
         )?;
         Ok(c.last_insert_rowid())
     }
 
-    /// A segment as a standalone Ogg Opus file (re-wrapped from its pack record, or read as-is).
-    pub fn read_audio(public_dir: &Path, seg: &Segment) -> std::io::Result<Vec<u8>> {
-        use std::io::{Read, Seek, SeekFrom};
-        let path = public_dir.join(seg.path.as_deref().unwrap_or_default());
-        match seg.offset {
-            None => std::fs::read(path),
-            Some(off) => {
-                let mut f = std::fs::File::open(path)?;
-                f.seek(SeekFrom::Start(off as u64))?;
-                let mut buf = vec![0u8; seg.size as usize];
-                f.read_exact(&mut buf)?;
-                crate::pack::Record::decode(&buf)
-                    .and_then(|r| r.to_ogg())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
-            }
-        }
-    }
-
-    pub fn update_segment_length(&self, id: i64, end: i64, samples: i64) -> Result<()> {
-        self.w().execute("UPDATE segments SET end_ms = ?2, samples = ?3 WHERE id = ?1", params![id, end, samples])?;
-        Ok(())
-    }
-
+    /// Legacy: completes a 'recording' row left by versions that created rows at burst start.
     pub fn finish_segment(&self, id: i64, end: i64, samples: i64, raw_size: i64) -> Result<()> {
         self.w().execute(
             "UPDATE segments SET end_ms = ?2, samples = ?3, raw_size = ?4, size = ?4, status = 'raw' WHERE id = ?1",

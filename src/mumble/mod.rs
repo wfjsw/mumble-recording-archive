@@ -1,6 +1,8 @@
 //! Minimal Mumble client protocol: TLS control channel with protobuf messages,
 //! voice received through the TCP tunnel (legacy, pre-1.5 voice packet format).
 
+pub mod crypt;
+pub mod udp;
 pub mod varint;
 
 #[allow(clippy::all)]
@@ -34,6 +36,8 @@ pub mod kind {
     pub const USER_STATE: u16 = 9;
     pub const TEXT_MESSAGE: u16 = 11;
     pub const PERMISSION_DENIED: u16 = 12;
+    pub const CRYPT_SETUP: u16 = 15;
+    pub const VOICE_TARGET: u16 = 19;
     pub const CODEC_VERSION: u16 = 21;
     pub const SERVER_CONFIG: u16 = 24;
 }
@@ -51,6 +55,8 @@ pub struct Frame {
 }
 
 pub struct Connection {
+    /// Resolved server address (UDP voice goes to the same host/port).
+    pub peer: std::net::SocketAddr,
     writer: WriteHalf<TlsStream<TcpStream>>,
     frames: mpsc::Receiver<std::io::Result<Frame>>,
 }
@@ -143,6 +149,7 @@ impl Connection {
             .context("connect timeout")?
             .with_context(|| format!("connect {addr}"))?;
         tcp.set_nodelay(true)?;
+        let peer = tcp.peer_addr()?;
         let name = ServerName::try_from(host).map_err(|e| anyhow!("bad host: {e}"))?;
         let stream = tokio_rustls::TlsConnector::from(Arc::new(tls)).connect(name, tcp).await.context("TLS handshake")?;
         let (mut reader, writer) = tokio::io::split(stream);
@@ -170,7 +177,7 @@ impl Connection {
                 }
             }
         });
-        Ok(Self { writer, frames })
+        Ok(Self { peer, writer, frames })
     }
 
     pub async fn send_raw(&mut self, kind: u16, payload: &[u8]) -> Result<()> {

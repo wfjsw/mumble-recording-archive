@@ -31,6 +31,9 @@ pub struct MumbleConfig {
     /// Comment shown on the bot user.
     pub comment: String,
     pub reconnect_delay_secs: u64,
+    /// Receive voice over encrypted UDP when it works, falling back to the TCP
+    /// tunnel automatically. Disable to always use TCP.
+    pub udp: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,7 +44,6 @@ pub struct RecordingConfig {
     /// Published files (indexes + audio) for the static web UI; relative to data_dir.
     /// Point the web server at this directory — it never contains the DB or keys.
     pub public_dir: String,
-    pub ffmpeg: String,
     /// Target bitrate for the VBR speech re-encode (libopus). 12k is compact and
     /// clearly intelligible; 16k–24k sounds closer to the original.
     pub bitrate: String,
@@ -51,7 +53,7 @@ pub struct RecordingConfig {
     pub max_segment_secs: i64,
     /// Bursts shorter than this are discarded (stray terminator packets etc).
     pub min_segment_ms: i64,
-    /// Number of concurrent ffmpeg transcode jobs (0 = auto).
+    /// Number of concurrent transcode jobs (0 = half the CPU cores).
     pub transcode_workers: usize,
     /// Keep the original pass-through Opus stream next to the re-encoded file.
     pub keep_raw: bool,
@@ -60,6 +62,8 @@ pub struct RecordingConfig {
     /// Drop silence inside talk bursts: bursts are split at pauses and only the
     /// speech regions are stored (at their exact time), so silence costs nothing.
     pub trim_silence: bool,
+    /// How often changed static index files are regenerated (seconds).
+    pub publish_interval_secs: u64,
     /// Peak level below which audio counts as silence.
     pub silence_threshold_db: f32,
     /// Only pauses at least this long are removed.
@@ -83,6 +87,7 @@ impl Default for MumbleConfig {
             announce_recording: true,
             comment: "This bot records voice in this server.".into(),
             reconnect_delay_secs: 5,
+            udp: true,
         }
     }
 }
@@ -92,7 +97,6 @@ impl Default for RecordingConfig {
         Self {
             data_dir: PathBuf::from("data"),
             public_dir: "public".into(),
-            ffmpeg: "ffmpeg".into(),
             bitrate: "12k".into(),
             gap_ms: 1500,
             max_segment_secs: 300,
@@ -101,6 +105,7 @@ impl Default for RecordingConfig {
             keep_raw: false,
             retention_days: 0,
             trim_silence: true,
+            publish_interval_secs: 10,
             silence_threshold_db: -45.0,
             min_silence_ms: 500,
             silence_pad_ms: 150,

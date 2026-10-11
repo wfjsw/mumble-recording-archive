@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
     conn.handshake(&name, &get("password", ""), &[], false).await?;
 
     let mut channels: HashMap<String, u32> = HashMap::new();
+    let mut users: HashMap<String, u32> = HashMap::new();
     let session;
     loop {
         let f = conn.recv().await?;
@@ -48,6 +49,12 @@ async fn main() -> Result<()> {
                 let m = pb::ChannelState::decode(&f.payload[..])?;
                 if let (Some(id), Some(n)) = (m.channel_id, m.name) {
                     channels.insert(n, id);
+                }
+            }
+            kind::USER_STATE => {
+                let m = pb::UserState::decode(&f.payload[..])?;
+                if let (Some(s), Some(n)) = (m.session, m.name) {
+                    users.insert(n, s);
                 }
             }
             kind::SERVER_SYNC => {
@@ -96,6 +103,20 @@ async fn main() -> Result<()> {
 
     tokio::time::sleep(Duration::from_millis(500 + start_delay)).await;
 
+    // --whisper <user>: voice goes only to that user (voice target 1), so load
+    // tests don't make the server relay every speaker to every other client.
+    let mut target = 0u8;
+    if let Some(who) = opts.get("whisper") {
+        let s = *users.get(who).with_context(|| format!("user {who} not online"))?;
+        let vt = pb::VoiceTarget {
+            id: Some(1),
+            targets: vec![pb::voice_target::Target { session: vec![s], ..Default::default() }],
+        };
+        conn.send(kind::VOICE_TARGET, &vt).await?;
+        target = 1;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
     let mut seq: u64 = 0;
     for r in 0..repeat {
         let t0 = Instant::now();
@@ -103,7 +124,7 @@ async fn main() -> Result<()> {
         for (i, p) in packets.iter().enumerate() {
             let n = opus::packet_samples(p).unwrap_or(960);
             let last = i == packets.len() - 1;
-            let pkt = mumble::build_client_audio(0, seq, p, last);
+            let pkt = mumble::build_client_audio(target, seq, p, last);
             // Simulate packet loss between client and server.
             if last || drop_every == 0 || i % drop_every != drop_every - 1 {
                 conn.send_raw(kind::UDP_TUNNEL, &pkt).await?;

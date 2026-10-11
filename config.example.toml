@@ -17,11 +17,13 @@ home_channel = ""            # e.g. "Lobby" or "Root/Lobby"; empty = stay in Roo
 announce_recording = true    # show Mumble's recording indicator on the bot
 comment = "This bot records voice in this server."
 reconnect_delay_secs = 5
+# Receive voice over Mumble's encrypted UDP channel when it works (falls back
+# to the TCP tunnel automatically, e.g. if UDP is firewalled). false = TCP only.
+udp = true
 
 [recording]
 data_dir = "data"            # private: archive.db, bot key, temp files
 public_dir = "public"        # (inside data_dir) what the web server publishes
-ffmpeg = "ffmpeg"
 # Speech is re-encoded to mono VBR Opus at this target (never above the bitrate
 # the client actually sent; lower-bitrate sources are stored as-is).
 # 12k ≈ 4–5 MB per hour of speech; 16k–24k sounds closer to the original.
@@ -35,6 +37,8 @@ retention_days = 0           # 0 = keep forever
 # Silence inside bursts is not stored at all: bursts are split into speech
 # regions placed at their exact time. Raise the threshold for noisy mics.
 trim_silence = true
+# Static index files (catalog/day indexes) are regenerated at most this often.
+publish_interval_secs = 10
 silence_threshold_db = -48.0
 min_silence_ms = 500
 silence_pad_ms = 150

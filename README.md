@@ -28,6 +28,10 @@ host serves them together with the built UI.
   (registered id → certificate hash → name), the channel they were in, and the exact
   wall-clock time. Shout/whisper is flagged.
 - Presence (who was in which channel when) and bot uptime are recorded too.
+- Voice over encrypted UDP (OCB2-AES128, like Mumble clients) when it works, with
+  automatic, lossless fallback to the TCP tunnel (e.g. firewalled UDP) and recovery.
+  A short reorder buffer puts UDP packets back in order; lost packets become silence
+  so the timeline stays aligned.
 - Crash-safe: in-progress bursts are written as Ogg Opus and recovered on restart.
 
 **Storage**
@@ -62,8 +66,9 @@ host serves them together with the built UI.
 
 ## Requirements
 
-- Rust (stable) to build the bot; `protoc` on `PATH` (or `PROTOC=…`) for the Mumble protobufs.
-- `ffmpeg` with libopus at runtime.
+- Rust (stable) plus a C compiler and `cmake` to build the bot (libopus is compiled from
+  source and linked in; `protoc` is vendored, override with `PROTOC=…`).
+- No runtime dependencies: Opus decoding/encoding and FLAC export are built in.
 - Node.js 20+ to build the UI.
 - A Mumble server (Opus voice). Place the bot where the voice you want recorded is
   delivered to it: its home channel, or channels a server admin adds as listeners for it.
@@ -114,15 +119,36 @@ cd web && DATA_TARGET=http://127.0.0.1:8088 npm run dev   # proxies /data to a s
 mumble-archive [--config config.toml]           # run the bot
 mumble-archive republish                        # rebuild all static index files
 mumble-archive export --from "2026-10-11 20:00" --to "2026-10-11 21:30" \
-    --layout downmix|tracks|channels|stems --format wav|flac|opus|mp3 \
+    --layout downmix|tracks|channels|stems --format wav|flac|opus \
     [--channels 3,4] [--speakers 7] --out meeting.flac
 ```
 
-The CLI export uses ffmpeg (FLAC/MP3 available) and reads the private database
+The CLI export adds FLAC and runs on the server, reading the private database
 directly.
+
+## Capacity
+
+Measured with simulated speakers all talking at once (continuous speech, 16-core machine,
+server and bot on one Docker network):
+
+| concurrent speakers | voice packets/s | recorded | transcode backlog after load |
+|---|---|---|---|
+| 50  | ~2 500  | 100 %   | none |
+| 150 | ~7 000  | 100 % (all 241 200 packets over UDP; bot ~40 MB RAM) | none |
+| 300 | ~14 000 | 99.25 % (test machine saturated: 300 clients + server + bot) | cleared within seconds |
+
+The voice path never touches disk or SQLite (a separate writer thread owns the files),
+so bursts of load don't drop packets; the UDP socket gets an 8 MB receive buffer.
+Transcoding uses libopus in-process (~110× real time per core to encode, ~1100× to
+decode); with the default workers (half the cores) it keeps up with hundreds of
+simultaneous speakers. Anything beyond is queued safely on disk and processed later.
 
 ## Mumble server notes
 
+- UDP voice uses the server's regular port (UDP 64738 by default). If UDP is blocked
+  between bot and server, voice keeps flowing over TCP; set `mumble.udp = false` to
+  skip UDP entirely. With `RUST_LOG=mumble_archive=debug` the bot logs which
+  transport voice arrives on.
 - When testing with many clients from one IP, Mumble's autoban
   (`autobanAttempts`) may block them. The bot itself reconnects with backoff.
 

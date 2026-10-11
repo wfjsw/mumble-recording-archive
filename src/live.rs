@@ -94,7 +94,7 @@ impl Publisher {
     }
 
     pub async fn run(self: Arc<Self>) {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut tick = tokio::time::interval(Duration::from_secs(self.cfg.recording.publish_interval_secs.max(1)));
         loop {
             tick.tick().await;
             let me = self.clone();
