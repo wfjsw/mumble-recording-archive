@@ -1,0 +1,76 @@
+:root {
+  --bg: #16171b;
+  --panel: #1d1f24;
+  --line: #2c2e35;
+  --text: #e4e5ea;
+  --dim: #8d909b;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  overflow: hidden;
+}
+
+button {
+  background: #2a2c33;
+  color: var(--text);
+  border: 1px solid #3a3d46;
+  border-radius: 5px;
+  padding: 4px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  background: #33363e;
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+button.primary {
+  background: #2f6fde;
+  border-color: #2f6fde;
+  color: white;
+}
+button.primary:hover:not(:disabled) {
+  background: #3b7cf0;
+}
+button.link {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  color: #7aa2ff;
+  font-size: 11px;
+}
+
+input[type='text'],
+input:not([type]),
+input[type='date'] {
+  background: #15161a;
+  color: var(--text);
+  border: 1px solid #3a3d46;
+  border-radius: 5px;
+  padding: 4px 8px;
+  font: inherit;
+}
+
+input[type='range'] {
+  accent-color: #7aa2ff;
+}
+
+input[type='checkbox'],
+input[type='radio'] {
+  accent-color: #2f6fde;
+  margin: 0;
+}

@@ -1,0 +1,40 @@
+# Mumble Archive — recording bot configuration.
+# Copy to config.toml and adjust. Every key is optional; defaults are shown.
+
+[mumble]
+address = "mumble.example.org:64738"
+username = "ArchiveBot"
+password = ""                # server password, if any
+tokens = []                  # access tokens for ACL groups
+tls_verify = false           # most Mumble servers use self-signed certificates
+# Bot identity (generated on first start; relative to data_dir). Register this
+# certificate on the server to give the bot stable permissions.
+cert_file = "bot-cert.pem"
+key_file = "bot-key.pem"
+# The bot only records voice the server sends to it: its own channel, whispers
+# or shouts aimed at it, and any channel listeners an admin set up for it.
+home_channel = ""            # e.g. "Lobby" or "Root/Lobby"; empty = stay in Root
+announce_recording = true    # show Mumble's recording indicator on the bot
+comment = "This bot records voice in this server."
+reconnect_delay_secs = 5
+
+[recording]
+data_dir = "data"            # private: archive.db, bot key, temp files
+public_dir = "public"        # (inside data_dir) what the web server publishes
+ffmpeg = "ffmpeg"
+# Speech is re-encoded to mono VBR Opus at this target (never above the bitrate
+# the client actually sent; lower-bitrate sources are stored as-is).
+# 12k ≈ 4–5 MB per hour of speech; 16k–24k sounds closer to the original.
+bitrate = "10k"
+gap_ms = 1500                # pause that closes a talk burst without a terminator
+max_segment_secs = 300       # longer bursts are split (contiguously)
+min_segment_ms = 60          # drop stray tiny bursts
+transcode_workers = 0        # 0 = half the CPU cores
+keep_raw = false             # also keep the original pass-through stream
+retention_days = 0           # 0 = keep forever
+# Silence inside bursts is not stored at all: bursts are split into speech
+# regions placed at their exact time. Raise the threshold for noisy mics.
+trim_silence = true
+silence_threshold_db = -48.0
+min_silence_ms = 500
+silence_pad_ms = 150
