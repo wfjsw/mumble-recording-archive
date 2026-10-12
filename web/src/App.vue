@@ -7,7 +7,7 @@ import Sidebar from './components/Sidebar.vue';
 import TopBar from './components/TopBar.vue';
 import Transport from './components/Transport.vue';
 import { engine } from './engine';
-import { catalog, ensureRange, refreshCatalog, segmentsIn, ui } from './state';
+import { catalog, ensureRange, refreshCatalog, segmentsIn, startAutoRefresh, ui } from './state';
 import { MIN } from './util';
 
 const transport = ref<InstanceType<typeof Transport>>();
@@ -15,6 +15,7 @@ const transport = ref<InstanceType<typeof Transport>>();
 onMounted(async () => {
   await loadConfig();
   await refreshCatalog();
+  startAutoRefresh();
   window.addEventListener('keydown', onKey);
   // Start on the most recent activity (up to 15 minutes of it), once the
   // timeline has its real width.

@@ -22,6 +22,15 @@ watch(
   { immediate: true },
 );
 
+/** Step the date picker by whole days and show that day. */
+function shiftDay(n: number) {
+  const [y, m, d] = date.value.split('-').map(Number);
+  if (!y) return;
+  const t = new Date(y, m - 1, d + n);
+  date.value = `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+  goDate();
+}
+
 function goDate() {
   const [y, m, d] = date.value.split('-').map(Number);
   if (!y) return;
@@ -53,12 +62,15 @@ function latest() {
       <span>{{ fmtDur(stats.totalMs) }} speech</span>
       <span>{{ stats.segments.toLocaleString() }} clips</span>
       <span :title="`original stream ${fmtBytes(stats.rawBytes)}`">{{ fmtBytes(stats.bytes) }} stored · {{ ratio }}</span>
-      <span v-if="stats.pending" class="warn">{{ stats.pending }} processing</span>
     </div>
     <div class="spacer" />
-    <input type="date" v-model="date" @change="goDate" title="Go to day" />
+    <div class="datenav">
+      <button @click="shiftDay(-1)" title="Previous day">‹</button>
+      <input type="date" v-model="date" @change="goDate" title="Go to day" />
+      <button @click="shiftDay(1)" title="Next day">›</button>
+    </div>
     <button @click="latest" title="Jump to the most recent speech">Latest</button>
-    <button @click="refreshCatalog" :disabled="ui.loading" :title="catalog ? `index generated ${fmtDateTime(catalog.generatedAt)}` : ''">
+    <button @click="refreshCatalog()" :disabled="ui.loading" :title="catalog ? `updated ${fmtDateTime(catalog.generatedAt)}` : ''">
       {{ ui.loading ? 'Loading…' : 'Refresh' }}
     </button>
   </div>
@@ -96,6 +108,13 @@ function latest() {
 }
 .spacer {
   flex: 1;
+}
+.datenav {
+  display: flex;
+  gap: 2px;
+}
+.datenav button {
+  padding-inline: 8px;
 }
 .error {
   padding: 8px 14px;

@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
 const SCHEMA: &str = r#"
@@ -16,7 +17,8 @@ CREATE TABLE IF NOT EXISTS speakers (
     user_id     INTEGER,
     cert_hash   TEXT,
     first_seen  INTEGER NOT NULL,
-    last_seen   INTEGER NOT NULL
+    last_seen   INTEGER NOT NULL,
+    rev         INTEGER NOT NULL DEFAULT 0  -- change number for publishing (see Store::rev)
 );
 
 CREATE TABLE IF NOT EXISTS channels (
@@ -26,7 +28,8 @@ CREATE TABLE IF NOT EXISTS channels (
     name        TEXT NOT NULL,
     position    INTEGER NOT NULL DEFAULT 0,
     created_at  INTEGER NOT NULL,
-    removed_at  INTEGER
+    removed_at  INTEGER,
+    rev         INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS channels_mumble ON channels(mumble_id);
 
@@ -45,7 +48,8 @@ CREATE TABLE IF NOT EXISTS segments (
     size        INTEGER NOT NULL DEFAULT 0, -- stored bytes (length inside the pack)
     raw_size    INTEGER NOT NULL DEFAULT 0,
     peaks       BLOB,                       -- PEAKS_PER_SEC values/s, sqrt-scaled u8 peak
-    error       TEXT
+    error       TEXT,
+    published   INTEGER NOT NULL DEFAULT 0  -- 1 = appended to its day log
 );
 CREATE INDEX IF NOT EXISTS segments_start ON segments(start_ms);
 CREATE INDEX IF NOT EXISTS segments_status ON segments(status);
@@ -56,21 +60,54 @@ CREATE TABLE IF NOT EXISTS presence (
     channel_id  INTEGER NOT NULL REFERENCES channels(id),
     session     INTEGER NOT NULL,
     start_ms    INTEGER NOT NULL,
-    end_ms      INTEGER
+    end_ms      INTEGER,
+    pub         INTEGER NOT NULL DEFAULT 0  -- bit 0: open published, bit 1: close published
 );
 CREATE INDEX IF NOT EXISTS presence_start ON presence(start_ms);
 
 CREATE TABLE IF NOT EXISTS uptime (
     id          INTEGER PRIMARY KEY,
     start_ms    INTEGER NOT NULL,
-    end_ms      INTEGER NOT NULL,
-    server      TEXT NOT NULL
+    end_ms      INTEGER NOT NULL,           -- last heartbeat while running
+    server      TEXT NOT NULL,
+    closed      INTEGER NOT NULL DEFAULT 0, -- 1 = session over, end_ms is final
+    pub         INTEGER NOT NULL DEFAULT 0  -- bit 0: open published, bit 1: close published
 );
+CREATE INDEX IF NOT EXISTS uptime_start ON uptime(start_ms);
+
+CREATE TABLE IF NOT EXISTS kv (
+    k           TEXT PRIMARY KEY,
+    v           INTEGER NOT NULL
+);
+"#;
+
+/// Columns added after the first release: (table, column, declaration).
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("speakers", "rev", "INTEGER NOT NULL DEFAULT 0"),
+    ("channels", "rev", "INTEGER NOT NULL DEFAULT 0"),
+    ("segments", "published", "INTEGER NOT NULL DEFAULT 0"),
+    ("presence", "pub", "INTEGER NOT NULL DEFAULT 0"),
+    ("uptime", "closed", "INTEGER NOT NULL DEFAULT 0"),
+    ("uptime", "pub", "INTEGER NOT NULL DEFAULT 0"),
+];
+
+/// Indexes on added columns (created after the migration).
+const INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS segments_unpublished ON segments(start_ms) WHERE published = 0;
+CREATE INDEX IF NOT EXISTS presence_unpublished ON presence(id) WHERE pub < 3;
+CREATE INDEX IF NOT EXISTS presence_end ON presence(end_ms);
+CREATE INDEX IF NOT EXISTS uptime_unpublished ON uptime(id) WHERE pub < 3;
+CREATE INDEX IF NOT EXISTS uptime_end ON uptime(end_ms);
+CREATE INDEX IF NOT EXISTS channels_rev ON channels(rev);
+CREATE INDEX IF NOT EXISTS speakers_rev ON speakers(rev);
 "#;
 
 pub struct Store {
     w: Mutex<Connection>,
     r: Mutex<Connection>,
+    /// Last change number given to a channel/speaker row; the publisher emits
+    /// rows whose `rev` is above the last one it published.
+    rev: AtomicI64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,8 +126,6 @@ pub struct Segment {
     /// Byte offset of the pack record; None means `path` is a standalone Ogg Opus file.
     pub offset: Option<i64>,
     pub size: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub peaks: Option<String>, // base64
 }
 
 /// One stored speech region of a burst.
@@ -102,17 +137,6 @@ pub struct Part {
     pub offset: i64,
     pub size: i64,
     pub peaks: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Speaker {
-    pub id: i64,
-    pub key: String,
-    pub name: String,
-    pub user_id: Option<i64>,
-    pub first_seen: i64,
-    pub last_seen: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,39 +161,46 @@ pub struct Track {
     pub last_ms: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Presence {
+/// A presence interval or bot session (`speaker_id`/`channel_id` are 0 for sessions).
+#[derive(Debug, Clone)]
+pub struct Interval {
+    pub id: i64,
     pub speaker_id: i64,
     pub channel_id: i64,
     pub start_ms: i64,
+    /// None while open.
     pub end_ms: Option<i64>,
+    /// Publishing state: bit 0 open published, bit 1 close published.
+    pub pub_state: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Interval {
+/// A finished segment as published in a day log.
+#[derive(Debug, Clone)]
+pub struct PubSegment {
+    pub id: i64,
+    pub speaker_id: i64,
+    pub channel_id: i64,
+    pub target: i64,
     pub start_ms: i64,
     pub end_ms: i64,
+    pub error: bool,
+    pub path: String,
+    pub offset: Option<i64>,
+    pub size: i64,
+    pub raw_size: i64,
+    pub peaks: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Day {
-    pub day: String,
-    pub segments: i64,
-    pub total_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Stats {
+/// Totals of the segments starting in a time range.
+#[derive(Debug, Clone, Default)]
+pub struct Totals {
     pub segments: i64,
     pub total_ms: i64,
     pub bytes: i64,
     pub raw_bytes: i64,
-    pub earliest_ms: Option<i64>,
-    pub latest_ms: Option<i64>,
+    pub first_ms: i64,
+    pub last_ms: i64,
+    /// Segments still being processed.
     pub pending: i64,
 }
 
@@ -204,9 +235,7 @@ impl Filter {
 /// Upper bound on segment duration used to make overlap queries index-friendly.
 pub const MAX_SEGMENT_MS: i64 = 3_600_000;
 
-fn seg_from_row(r: &rusqlite::Row, with_peaks: bool) -> rusqlite::Result<Segment> {
-    use base64::Engine;
-    let peaks: Option<Vec<u8>> = if with_peaks { r.get(11)? } else { None };
+fn seg_from_row(r: &rusqlite::Row) -> rusqlite::Result<Segment> {
     Ok(Segment {
         id: r.get(0)?,
         speaker_id: r.get(1)?,
@@ -219,20 +248,79 @@ fn seg_from_row(r: &rusqlite::Row, with_peaks: bool) -> rusqlite::Result<Segment
         path: r.get(8)?,
         size: r.get(9)?,
         offset: r.get(10)?,
-        peaks: peaks.map(|p| base64::engine::general_purpose::STANDARD.encode(p)),
     })
 }
 
 const SEG_COLS: &str = "id, speaker_id, channel_id, session, target, start_ms, end_ms, status, path, size, pack_offset";
+
+const PUB_SEG_COLS: &str =
+    "id, speaker_id, channel_id, target, start_ms, end_ms, status, COALESCE(path, ''), pack_offset, size, raw_size, COALESCE(peaks, x'')";
+
+fn pub_seg_row(r: &rusqlite::Row) -> rusqlite::Result<PubSegment> {
+    Ok(PubSegment {
+        id: r.get(0)?,
+        speaker_id: r.get(1)?,
+        channel_id: r.get(2)?,
+        target: r.get(3)?,
+        start_ms: r.get(4)?,
+        end_ms: r.get(5)?,
+        error: r.get::<_, String>(6)? != "ready",
+        path: r.get(7)?,
+        offset: r.get(8)?,
+        size: r.get(9)?,
+        raw_size: r.get(10)?,
+        peaks: r.get(11)?,
+    })
+}
+
+fn interval_row(r: &rusqlite::Row) -> rusqlite::Result<Interval> {
+    Ok(Interval {
+        id: r.get(0)?,
+        speaker_id: r.get(1)?,
+        channel_id: r.get(2)?,
+        start_ms: r.get(3)?,
+        end_ms: r.get(4)?,
+        pub_state: r.get(5)?,
+    })
+}
+
+const CHANNEL_COLS: &str = "id, mumble_id, parent_id, name, position, removed_at";
+
+fn channel_row(r: &rusqlite::Row) -> rusqlite::Result<Channel> {
+    Ok(Channel {
+        id: r.get(0)?,
+        mumble_id: r.get(1)?,
+        parent_id: r.get(2)?,
+        name: r.get(3)?,
+        position: r.get(4)?,
+        removed_at: r.get(5)?,
+    })
+}
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let w = Connection::open(path)?;
         w.busy_timeout(std::time::Duration::from_secs(10))?;
         w.execute_batch(SCHEMA)?;
+        for (table, col, decl) in ADDED_COLUMNS {
+            let has = w.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{col}'"))?.exists([])?;
+            if !has {
+                w.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"))?;
+            }
+        }
+        w.execute_batch(INDEXES)?;
+        let rev: i64 = w.query_row(
+            "SELECT MAX(COALESCE((SELECT MAX(rev) FROM channels), 0), COALESCE((SELECT MAX(rev) FROM speakers), 0))",
+            [],
+            |r| r.get(0),
+        )?;
         let r = Connection::open(path)?;
         r.busy_timeout(std::time::Duration::from_secs(10))?;
-        Ok(Self { w: Mutex::new(w), r: Mutex::new(r) })
+        Ok(Self { w: Mutex::new(w), r: Mutex::new(r), rev: AtomicI64::new(rev) })
+    }
+
+    fn next_rev(&self) -> i64 {
+        self.rev.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn w(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -246,11 +334,14 @@ impl Store {
 
     pub fn upsert_speaker(&self, key: &str, name: &str, user_id: Option<i64>, hash: Option<&str>, now: i64) -> Result<i64> {
         let c = self.w();
+        // rev only moves when something the UI shows (name, user id) changes.
         c.execute(
-            "INSERT INTO speakers(key, name, user_id, cert_hash, first_seen, last_seen) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            "INSERT INTO speakers(key, name, user_id, cert_hash, first_seen, last_seen, rev) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)
              ON CONFLICT(key) DO UPDATE SET name = excluded.name, last_seen = excluded.last_seen,
-                user_id = COALESCE(excluded.user_id, user_id), cert_hash = COALESCE(excluded.cert_hash, cert_hash)",
-            params![key, name, user_id, hash, now],
+                user_id = COALESCE(excluded.user_id, user_id), cert_hash = COALESCE(excluded.cert_hash, cert_hash),
+                rev = CASE WHEN name IS NOT excluded.name OR user_id IS NOT COALESCE(excluded.user_id, user_id)
+                           THEN excluded.rev ELSE rev END",
+            params![key, name, user_id, hash, now, self.next_rev()],
         )?;
         Ok(c.query_row("SELECT id FROM speakers WHERE key = ?1", [key], |r| r.get(0))?)
     }
@@ -269,15 +360,6 @@ impl Store {
             c.execute("DELETE FROM speakers WHERE id = ?1", [id])?;
         }
         Ok(())
-    }
-
-    pub fn speakers(&self) -> Result<Vec<Speaker>> {
-        let c = self.r();
-        let mut st = c.prepare("SELECT id, key, name, user_id, first_seen, last_seen FROM speakers ORDER BY name COLLATE NOCASE")?;
-        let rows = st.query_map([], |r| {
-            Ok(Speaker { id: r.get(0)?, key: r.get(1)?, name: r.get(2)?, user_id: r.get(3)?, first_seen: r.get(4)?, last_seen: r.get(5)? })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     // ---- channels ----
@@ -307,15 +389,16 @@ impl Store {
         match id {
             Some(id) => {
                 c.execute(
-                    "UPDATE channels SET name = ?2, parent_id = ?3, position = ?4, removed_at = NULL WHERE id = ?1",
-                    params![id, name, parent, position],
+                    "UPDATE channels SET name = ?2, parent_id = ?3, position = ?4, removed_at = NULL, rev = ?5
+                     WHERE id = ?1 AND (name IS NOT ?2 OR parent_id IS NOT ?3 OR position IS NOT ?4 OR removed_at IS NOT NULL)",
+                    params![id, name, parent, position, self.next_rev()],
                 )?;
                 Ok(id)
             }
             None => {
                 c.execute(
-                    "INSERT INTO channels(mumble_id, parent_id, name, position, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![mumble_id, parent, name, position, now],
+                    "INSERT INTO channels(mumble_id, parent_id, name, position, created_at, rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![mumble_id, parent, name, position, now, self.next_rev()],
                 )?;
                 Ok(c.last_insert_rowid())
             }
@@ -324,14 +407,15 @@ impl Store {
 
     pub fn update_channel(&self, id: i64, name: &str, parent: Option<i64>, position: i64) -> Result<()> {
         self.w().execute(
-            "UPDATE channels SET name = ?2, parent_id = ?3, position = ?4 WHERE id = ?1",
-            params![id, name, parent, position],
+            "UPDATE channels SET name = ?2, parent_id = ?3, position = ?4, rev = ?5
+             WHERE id = ?1 AND (name IS NOT ?2 OR parent_id IS NOT ?3 OR position IS NOT ?4)",
+            params![id, name, parent, position, self.next_rev()],
         )?;
         Ok(())
     }
 
     pub fn remove_channel(&self, id: i64, now: i64) -> Result<()> {
-        self.w().execute("UPDATE channels SET removed_at = ?2 WHERE id = ?1", params![id, now])?;
+        self.w().execute("UPDATE channels SET removed_at = ?2, rev = ?3 WHERE id = ?1", params![id, now, self.next_rev()])?;
         Ok(())
     }
 
@@ -339,25 +423,17 @@ impl Store {
     pub fn mark_channels_removed_except(&self, alive: &[i64], now: i64) -> Result<()> {
         let list = alive.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
         self.w().execute(
-            &format!("UPDATE channels SET removed_at = ?1 WHERE removed_at IS NULL AND id NOT IN ({list})"),
-            [now],
+            &format!("UPDATE channels SET removed_at = ?1, rev = ?2 WHERE removed_at IS NULL AND id NOT IN ({list})"),
+            params![now, self.next_rev()],
         )?;
         Ok(())
     }
 
-    pub fn channels(&self) -> Result<Vec<Channel>> {
+    /// Channels that currently exist on the server.
+    pub fn live_channels(&self) -> Result<Vec<Channel>> {
         let c = self.r();
-        let mut st = c.prepare("SELECT id, mumble_id, parent_id, name, position, removed_at FROM channels ORDER BY position, name COLLATE NOCASE")?;
-        let rows = st.query_map([], |r| {
-            Ok(Channel {
-                id: r.get(0)?,
-                mumble_id: r.get(1)?,
-                parent_id: r.get(2)?,
-                name: r.get(3)?,
-                position: r.get(4)?,
-                removed_at: r.get(5)?,
-            })
-        })?;
+        let mut st = c.prepare(&format!("SELECT {CHANNEL_COLS} FROM channels WHERE removed_at IS NULL ORDER BY id"))?;
+        let rows = st.query_map([], channel_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -409,6 +485,7 @@ impl Store {
         let last: Option<i64> = c.query_row("SELECT MAX(end_ms) FROM uptime", [], |r| r.get(0))?;
         let last = last.unwrap_or(0);
         c.execute("UPDATE presence SET end_ms = MAX(start_ms, ?1) WHERE end_ms IS NULL", [last])?;
+        c.execute("UPDATE uptime SET closed = 1 WHERE closed = 0", [])?;
         Ok(())
     }
 
@@ -423,23 +500,80 @@ impl Store {
         Ok(())
     }
 
-    pub fn presence(&self, from: i64, to: i64) -> Result<Vec<Presence>> {
+    /// End of a bot session (disconnect).
+    pub fn close_uptime(&self, id: i64, now: i64) -> Result<()> {
+        self.w().execute("UPDATE uptime SET end_ms = MAX(start_ms, ?2), closed = 1 WHERE id = ?1", params![id, now])?;
+        Ok(())
+    }
+
+    /// Presence intervals overlapping [from, to). Split into index-friendly parts:
+    /// a plain `start < to AND end > from` would scan all history before `to`.
+    pub fn presence_overlapping(&self, from: i64, to: i64) -> Result<Vec<Interval>> {
+        self.intervals("presence", "speaker_id, channel_id", "end_ms", from, to)
+    }
+
+    /// Bot sessions overlapping [from, to); open sessions have `end_ms` None.
+    pub fn uptime_overlapping(&self, from: i64, to: i64) -> Result<Vec<Interval>> {
+        self.intervals("uptime", "0, 0", "CASE WHEN closed = 1 THEN end_ms END", from, to)
+    }
+
+    /// Presence intervals / bot sessions starting in [from, to) (`table` is "presence" or "uptime").
+    pub fn intervals_starting(&self, table: &str, from: i64, to: i64) -> Result<Vec<Interval>> {
+        let (cols, end) = Self::interval_cols(table);
         let c = self.r();
-        let mut st = c.prepare(
-            "SELECT speaker_id, channel_id, start_ms, end_ms FROM presence
-             WHERE start_ms < ?2 AND (end_ms IS NULL OR end_ms > ?1) ORDER BY start_ms",
-        )?;
-        let rows = st.query_map(params![from, to], |r| {
-            Ok(Presence { speaker_id: r.get(0)?, channel_id: r.get(1)?, start_ms: r.get(2)?, end_ms: r.get(3)? })
-        })?;
+        let mut st = c.prepare(&format!(
+            "SELECT id, {cols}, start_ms, {end}, pub FROM {table} WHERE start_ms >= ?1 AND start_ms < ?2 ORDER BY start_ms"
+        ))?;
+        let rows = st.query_map(params![from, to], interval_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn uptime(&self, from: i64, to: i64) -> Result<Vec<Interval>> {
+    fn interval_cols(table: &str) -> (&'static str, &'static str) {
+        match table {
+            "presence" => ("speaker_id, channel_id", "end_ms"),
+            _ => ("0, 0", "CASE WHEN closed = 1 THEN end_ms END"),
+        }
+    }
+
+    fn intervals(&self, table: &str, cols: &str, end: &str, from: i64, to: i64) -> Result<Vec<Interval>> {
         let c = self.r();
-        let mut st = c.prepare("SELECT start_ms, end_ms FROM uptime WHERE start_ms < ?2 AND end_ms > ?1 ORDER BY start_ms")?;
-        let rows = st.query_map(params![from, to], |r| Ok(Interval { start_ms: r.get(0)?, end_ms: r.get(1)? }))?;
+        let open = if table == "uptime" { "closed = 0" } else { "end_ms IS NULL" };
+        let sql = format!(
+            "SELECT id, {cols}, start_ms, {end}, pub FROM {table} WHERE start_ms >= ?1 AND start_ms < ?2
+             UNION ALL SELECT id, {cols}, start_ms, {end}, pub FROM {table} WHERE end_ms > ?1 AND start_ms < ?1 AND NOT ({open})
+             UNION ALL SELECT id, {cols}, start_ms, {end}, pub FROM {table} WHERE {open} AND start_ms < ?1
+             ORDER BY 4"
+        );
+        let mut st = c.prepare(&sql)?;
+        let rows = st.query_map(params![from, to], interval_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Presence/uptime rows with unpublished changes (open or close).
+    pub fn unpublished_intervals(&self, table: &str) -> Result<Vec<Interval>> {
+        let c = self.r();
+        let sql = match table {
+            "presence" => "SELECT id, speaker_id, channel_id, start_ms, end_ms, pub FROM presence
+                           WHERE pub < 3 AND NOT (pub = 1 AND end_ms IS NULL) ORDER BY id",
+            _ => "SELECT id, 0, 0, start_ms, CASE WHEN closed = 1 THEN end_ms END, pub FROM uptime
+                  WHERE pub < 3 AND NOT (pub = 1 AND closed = 0) ORDER BY id",
+        };
+        let mut st = c.prepare(sql)?;
+        let rows = st.query_map([], interval_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_interval_pub(&self, table: &str, ids: &[(i64, i64)]) -> Result<()> {
+        let mut c = self.w();
+        let tx = c.transaction()?;
+        {
+            let mut st = tx.prepare(&format!("UPDATE {table} SET pub = ?2 WHERE id = ?1"))?;
+            for (id, p) in ids {
+                st.execute(params![id, p])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     // ---- segments ----
@@ -535,57 +669,71 @@ impl Store {
     pub fn segments_by_status(&self, status: &str) -> Result<Vec<Segment>> {
         let c = self.r();
         let mut st = c.prepare(&format!("SELECT {SEG_COLS} FROM segments WHERE status = ?1 ORDER BY id"))?;
-        let rows = st.query_map([status], |r| seg_from_row(r, false))?;
+        let rows = st.query_map([status], seg_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn segment(&self, id: i64) -> Result<Option<Segment>> {
         let c = self.r();
-        Ok(c.query_row(&format!("SELECT {SEG_COLS}, peaks FROM segments WHERE id = ?1"), [id], |r| seg_from_row(r, true))
-            .optional()?)
+        Ok(c.query_row(&format!("SELECT {SEG_COLS} FROM segments WHERE id = ?1"), [id], seg_from_row).optional()?)
     }
 
     /// Segments overlapping [from, to), ordered by start.
-    pub fn segments(&self, from: i64, to: i64, f: &Filter, with_peaks: bool) -> Result<Vec<Segment>> {
+    pub fn segments(&self, from: i64, to: i64, f: &Filter) -> Result<Vec<Segment>> {
         let c = self.r();
         let sql = format!(
-            "SELECT {SEG_COLS}, {} FROM segments WHERE start_ms >= ?1 AND start_ms < ?2 AND end_ms > ?3 {} ORDER BY start_ms",
-            if with_peaks { "peaks" } else { "NULL" },
+            "SELECT {SEG_COLS} FROM segments WHERE start_ms >= ?1 AND start_ms < ?2 AND end_ms > ?3 {} ORDER BY start_ms",
             f.sql()
         );
         let mut st = c.prepare(&sql)?;
-        let rows = st.query_map(params![from - MAX_SEGMENT_MS, to, from], |r| seg_from_row(r, with_peaks))?;
+        let rows = st.query_map(params![from - MAX_SEGMENT_MS, to, from], seg_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Segments starting in [from, to) with peaks (for per-day indexes).
-    pub fn segments_starting(&self, from: i64, to: i64) -> Result<Vec<Segment>> {
+    /// Finished segments not yet appended to a day log, oldest first.
+    pub fn unpublished_segments(&self, limit: i64) -> Result<Vec<PubSegment>> {
         let c = self.r();
-        let mut st = c.prepare(&format!("SELECT {SEG_COLS}, peaks FROM segments WHERE start_ms >= ?1 AND start_ms < ?2 ORDER BY start_ms"))?;
-        let rows = st.query_map(params![from, to], |r| seg_from_row(r, true))?;
+        let mut st = c.prepare(&format!(
+            "SELECT {PUB_SEG_COLS} FROM segments WHERE published = 0 AND status IN ('ready','error') ORDER BY start_ms LIMIT ?1"
+        ))?;
+        let rows = st.query_map([limit], pub_seg_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn segments_by_ids(&self, ids: &[i64]) -> Result<Vec<Segment>> {
-        if ids.is_empty() {
-            return Ok(vec![]);
+    /// Finished segments starting in [from, to) (full day log rebuild). Peaks are
+    /// empty for segments already published: the day logs hold them.
+    pub fn finished_segments(&self, from: i64, to: i64) -> Result<Vec<PubSegment>> {
+        let c = self.r();
+        let mut st = c.prepare(&format!(
+            "SELECT {PUB_SEG_COLS} FROM segments WHERE start_ms >= ?1 AND start_ms < ?2 AND status IN ('ready','error') ORDER BY start_ms"
+        ))?;
+        let rows = st.query_map(params![from, to], pub_seg_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn mark_published(&self, ids: &[i64]) -> Result<()> {
+        let mut c = self.w();
+        let tx = c.transaction()?;
+        {
+            // The day log now holds the waveform peaks; the database doesn't need them.
+            let mut st = tx.prepare("UPDATE segments SET published = 1, peaks = NULL WHERE id = ?1")?;
+            for id in ids {
+                st.execute([id])?;
+            }
         }
-        let list = ids.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
-        let c = self.r();
-        let mut st = c.prepare(&format!("SELECT {SEG_COLS}, peaks FROM segments WHERE id IN ({list})"))?;
-        let rows = st.query_map([], |r| seg_from_row(r, true))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        tx.commit()?;
+        Ok(())
     }
 
     /// First segment starting after `t` (dir > 0) or last segment ending before `t` (dir < 0).
     pub fn neighbour(&self, t: i64, dir: i32, f: &Filter) -> Result<Option<Segment>> {
         let c = self.r();
         let sql = if dir >= 0 {
-            format!("SELECT {SEG_COLS}, NULL FROM segments WHERE start_ms > ?1 {} ORDER BY start_ms LIMIT 1", f.sql())
+            format!("SELECT {SEG_COLS} FROM segments WHERE start_ms > ?1 {} ORDER BY start_ms LIMIT 1", f.sql())
         } else {
-            format!("SELECT {SEG_COLS}, NULL FROM segments WHERE start_ms < ?1 {} ORDER BY start_ms DESC LIMIT 1", f.sql())
+            format!("SELECT {SEG_COLS} FROM segments WHERE start_ms < ?1 {} ORDER BY start_ms DESC LIMIT 1", f.sql())
         };
-        Ok(c.query_row(&sql, [t], |r| seg_from_row(r, false)).optional()?)
+        Ok(c.query_row(&sql, [t], seg_from_row).optional()?)
     }
 
     pub fn tracks(&self, from: i64, to: i64) -> Result<Vec<Track>> {
@@ -607,51 +755,113 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Per-day totals; `tz_offset_min` is minutes east of UTC for the viewer.
-    pub fn days(&self, tz_offset_min: i64) -> Result<Vec<Day>> {
-        let c = self.r();
-        let mut st = c.prepare(
-            "SELECT date((start_ms + ?1 * 60000) / 1000, 'unixepoch') AS d, COUNT(*), SUM(end_ms - start_ms)
-             FROM segments GROUP BY d ORDER BY d",
-        )?;
-        let rows = st.query_map([tz_offset_min], |r| Ok(Day { day: r.get(0)?, segments: r.get(1)?, total_ms: r.get(2)? }))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    pub fn stats(&self) -> Result<Stats> {
+    /// Totals of the segments starting in [from, to) (indexed range scan).
+    pub fn totals(&self, from: i64, to: i64) -> Result<Totals> {
         let c = self.r();
         Ok(c.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(end_ms - start_ms),0), COALESCE(SUM(size),0), COALESCE(SUM(raw_size),0),
-                    MIN(start_ms), MAX(end_ms), (SELECT COUNT(*) FROM segments WHERE status IN ('raw','recording'))
-             FROM segments",
-            [],
+            "SELECT COUNT(*), COALESCE(SUM(end_ms - start_ms), 0), COALESCE(SUM(size), 0), COALESCE(SUM(raw_size), 0),
+                    COALESCE(MIN(start_ms), 0), COALESCE(MAX(end_ms), 0),
+                    COALESCE(SUM(status IN ('raw', 'recording')), 0)
+             FROM segments WHERE start_ms >= ?1 AND start_ms < ?2",
+            params![from, to],
             |r| {
-                Ok(Stats {
+                Ok(Totals {
                     segments: r.get(0)?,
                     total_ms: r.get(1)?,
                     bytes: r.get(2)?,
                     raw_bytes: r.get(3)?,
-                    earliest_ms: r.get(4)?,
-                    latest_ms: r.get(5)?,
+                    first_ms: r.get(4)?,
+                    last_ms: r.get(5)?,
                     pending: r.get(6)?,
                 })
             },
         )?)
     }
 
-    pub fn segments_before(&self, t: i64, limit: i64) -> Result<Vec<Segment>> {
+    /// Earliest time anything was recorded (segments, presence or sessions).
+    pub fn earliest_ms(&self) -> Result<Option<i64>> {
         let c = self.r();
-        let mut st = c.prepare(&format!(
-            "SELECT {SEG_COLS}, NULL FROM segments WHERE end_ms < ?1 AND status IN ('ready','error') ORDER BY start_ms LIMIT ?2"
-        ))?;
-        let rows = st.query_map(params![t, limit], |r| seg_from_row(r, false))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        Ok(c.query_row(
+            "SELECT MIN(t) FROM (SELECT MIN(start_ms) AS t FROM segments UNION ALL SELECT MIN(start_ms) FROM presence
+             UNION ALL SELECT MIN(start_ms) FROM uptime)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Delete the segments starting in [from, to); returns the files they used.
+    pub fn delete_segments_in(&self, from: i64, to: i64) -> Result<Vec<String>> {
+        let c = self.w();
+        let mut st = c.prepare("SELECT DISTINCT path FROM segments WHERE start_ms >= ?1 AND start_ms < ?2 AND path IS NOT NULL")?;
+        let paths = st.query_map(params![from, to], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        c.execute("DELETE FROM segments WHERE start_ms >= ?1 AND start_ms < ?2", params![from, to])?;
+        Ok(paths)
     }
 
     pub fn prune_presence_before(&self, t: i64) -> Result<()> {
         let c = self.w();
         c.execute("DELETE FROM presence WHERE end_ms IS NOT NULL AND end_ms < ?1", [t])?;
-        c.execute("DELETE FROM uptime WHERE end_ms < ?1", [t])?;
+        c.execute("DELETE FROM uptime WHERE closed = 1 AND end_ms < ?1", [t])?;
+        Ok(())
+    }
+
+    pub fn channel(&self, id: i64) -> Result<Option<Channel>> {
+        let c = self.r();
+        Ok(c.query_row(&format!("SELECT {CHANNEL_COLS} FROM channels WHERE id = ?1"), [id], channel_row).optional()?)
+    }
+
+    /// Channel rows changed after revision `rev`, with their revision.
+    pub fn channels_since(&self, rev: i64) -> Result<Vec<(Channel, i64)>> {
+        let c = self.r();
+        let mut st = c.prepare(&format!("SELECT {CHANNEL_COLS}, rev FROM channels WHERE rev > ?1 ORDER BY rev"))?;
+        let rows = st.query_map([rev], |r| Ok((channel_row(r)?, r.get(6)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// (id, name, user_id) of a speaker.
+    pub fn speaker(&self, id: i64) -> Result<Option<(i64, String, Option<i64>)>> {
+        let c = self.r();
+        Ok(c.query_row("SELECT id, name, user_id FROM speakers WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?)
+    }
+
+    /// Speaker ids whose name/user id changed after revision `rev`, and the highest revision seen.
+    pub fn speakers_since(&self, rev: i64) -> Result<(Vec<i64>, i64)> {
+        let c = self.r();
+        let mut st = c.prepare("SELECT id, rev FROM speakers WHERE rev > ?1 ORDER BY rev")?;
+        let rows = st.query_map([rev], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let max = rows.iter().map(|r| r.1).max().unwrap_or(rev);
+        Ok((rows.into_iter().map(|r| r.0).collect(), max))
+    }
+
+    pub fn current_rev(&self) -> i64 {
+        self.rev.load(Ordering::Relaxed)
+    }
+
+    /// Return space freed by deleted data to the filesystem (slow on big databases; rare use).
+    pub fn vacuum(&self) -> Result<()> {
+        self.w().execute_batch("VACUUM")?;
+        Ok(())
+    }
+
+    pub fn kv_get(&self, k: &str) -> Result<Option<i64>> {
+        Ok(self.r().query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).optional()?)
+    }
+
+    pub fn kv_set(&self, k: &str, v: i64) -> Result<()> {
+        self.w().execute("INSERT INTO kv(k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v", params![k, v])?;
+        Ok(())
+    }
+
+    /// After a full rebuild of the logs: everything currently stored counts as published.
+    pub fn mark_all_published(&self) -> Result<()> {
+        let c = self.w();
+        c.execute_batch(
+            "UPDATE segments SET published = 1 WHERE published = 0 AND status IN ('ready','error');
+             UPDATE segments SET peaks = NULL WHERE published = 1 AND peaks IS NOT NULL;
+             UPDATE presence SET pub = CASE WHEN end_ms IS NULL THEN 1 ELSE 3 END WHERE pub < 3;
+             UPDATE uptime SET pub = CASE WHEN closed = 0 THEN 1 ELSE 3 END WHERE pub < 3;",
+        )?;
         Ok(())
     }
 }

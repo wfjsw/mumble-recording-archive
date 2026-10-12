@@ -1,9 +1,8 @@
-// Client-side export of a time range: segments are decoded in the browser,
-// placed sample-accurately and mixed into the requested channel layout.
+// Client-side export of a time range: the plan (which clips, which outputs) is
+// made here; rendering (decode, mix, encode) runs in a Web Worker.
 
-import type { Seg } from './api';
-import * as audio from './audio';
-import { OggOpusWriter, ZipWriter, toPcm16, wavHeader } from './encode';
+import { fileUrl, type Seg } from './api';
+import type { ExportItem, ExportJob, ExportMessage } from './export.worker';
 import {
   channelPath,
   tree,
@@ -37,6 +36,8 @@ export interface Output {
 
 export interface Plan {
   outputs: Output[];
+  /** One file per output (zip) instead of one multichannel file. */
+  split: boolean;
   segs: Seg[];
   speechMs: number;
   warnings: string[];
@@ -44,12 +45,17 @@ export interface Plan {
   filename: string;
 }
 
-const RATE = audio.RATE;
-const BLOCK = 10 * RATE;
-
 export const opusSupported = typeof (globalThis as any).AudioEncoder !== 'undefined';
 
 const pad = (n: number) => String(n).padStart(2, '0');
+
+/**
+ * Stems are always separate files. Multichannel layouts in Opus are too:
+ * Opus beyond stereo is poorly supported by players and editors, so each
+ * speaker track (or Mumble channel) becomes its own aligned file.
+ */
+export const splitsFiles = (o: Pick<ExportOptions, 'layout' | 'format'>) =>
+  o.layout === 'stems' || (o.format === 'opus' && (o.layout === 'tracks' || o.layout === 'channels'));
 
 export async function makePlan(o: ExportOptions): Promise<Plan> {
   await ensureRange(o.from, o.to);
@@ -84,153 +90,81 @@ export async function makePlan(o: ExportOptions): Promise<Plan> {
   const errors: string[] = [];
   if (!outputs.length) errors.push('No recordings in the selected range for the chosen tracks.');
   if (o.to - o.from > 3 * HOUR) warnings.push('Long range: the export is assembled in memory and may take a while.');
-  if (o.format === 'opus') {
-    if (!opusSupported) errors.push('This browser has no WebCodecs AudioEncoder; choose WAV.');
-    if (o.layout !== 'stems' && outputs.length > 2) errors.push('Opus export supports at most 2 channels here; use WAV for multitrack.');
-  }
-  if (o.format === 'wav' && o.layout !== 'stems' && outputs.length > 2) {
+  const split = splitsFiles(o);
+  if (o.format === 'opus' && !opusSupported) errors.push('This browser has no WebCodecs AudioEncoder; choose WAV.');
+  if (o.format === 'wav' && !split && outputs.length > 2) {
     warnings.push('Multichannel WAV: channel N = track N (no speaker positions). Audacity/Audition import it as separate tracks.');
   }
   const speechMs = segs.reduce((a, s) => a + Math.min(s.endMs, o.to) - Math.max(s.startMs, o.from), 0);
   const d = new Date(o.from);
   const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-  const ext = o.layout === 'stems' ? 'zip' : o.format === 'opus' ? 'opus' : 'wav';
+  const ext = split ? 'zip' : o.format === 'opus' ? 'opus' : 'wav';
   const name = { downmix: 'downmix', tracks: 'multitrack', channels: 'channels', stems: 'stems' }[o.layout];
   const filename = `mumble_${stamp}_${Math.round((o.to - o.from) / 1000)}s_${name}.${ext}`;
-  return { outputs, segs, speechMs, warnings, errors, filename };
+  return { outputs, split, segs, speechMs, warnings, errors, filename };
 }
 
-interface Sink {
-  write(chans: Float32Array[]): Promise<void> | void;
-  finish(frames: number): Promise<Uint8Array<ArrayBuffer>[]>;
-}
-
-function wavSink(channels: number): Sink {
-  const parts: Uint8Array<ArrayBuffer>[] = [];
-  return {
-    write: (c) => void parts.push(toPcm16(c)),
-    finish: async (frames) => [wavHeader(channels, frames) as Uint8Array<ArrayBuffer>, ...parts],
-  };
-}
-
-function opusSink(channels: number): Sink {
-  let writer: OggOpusWriter | null = null;
-  let failure: Error | null = null;
-  let frames = 0;
-  const pending: { data: Uint8Array; samples: number }[] = [];
-  const AE = (globalThis as any).AudioEncoder;
-  const AD = (globalThis as any).AudioData;
-  const enc = new AE({
-    output: (chunk: any, meta: any) => {
-      if (!writer) {
-        // OpusHead from the encoder carries the real pre-skip.
-        const desc: ArrayBuffer | undefined = meta?.decoderConfig?.description;
-        let preSkip = 312;
-        if (desc && desc.byteLength >= 12) preSkip = new DataView(desc).getUint16(10, true);
-        writer = new OggOpusWriter(channels, preSkip);
-      }
-      const data = new Uint8Array(chunk.byteLength);
-      chunk.copyTo(data);
-      pending.push({ data, samples: Math.round(((chunk.duration ?? 20000) * RATE) / 1e6) });
-      for (const p of pending.splice(0)) writer.write(p.data, p.samples);
-    },
-    error: (e: Error) => (failure = e),
-  });
-  enc.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: channels, bitrate: 24000 * channels });
-  return {
-    write: (chans) => {
-      const n = chans[0].length;
-      const planar = new Float32Array(n * channels);
-      chans.forEach((c, i) => planar.set(c, i * n));
-      const ad = new AD({
-        format: 'f32-planar',
-        sampleRate: RATE,
-        numberOfFrames: n,
-        numberOfChannels: channels,
-        timestamp: Math.round((frames / RATE) * 1e6),
-        data: planar,
-      });
-      frames += n;
-      enc.encode(ad);
-      ad.close();
-    },
-    finish: async (total) => {
-      await enc.flush();
-      enc.close();
-      if (failure) throw failure;
-      if (!writer) writer = new OggOpusWriter(channels);
-      return (writer as OggOpusWriter).finish(total);
-    },
-  };
-}
-
-export async function runExport(
+/** Render the export in a Web Worker (fetch, decode, mix, encode); resolves with the file. */
+export function runExport(
   o: ExportOptions,
   plan: Plan,
   onProgress: (f: number) => void,
   signal: AbortSignal,
 ): Promise<{ blob: Blob; filename: string }> {
-  const total = Math.round(((o.to - o.from) * RATE) / 1000);
-  const nOut = plan.outputs.length;
   const outOf = new Map<string, number>();
   plan.outputs.forEach((out, i) => out.keys.forEach((k) => outOf.set(k, i)));
-  const gain = (s: Seg) => (o.applyMix ? trackGain(s.channelId, s.speakerId) : 1);
-  const mk = (ch: number) => (o.format === 'opus' ? opusSink(ch) : wavSink(ch));
-  const sinks: Sink[] = o.layout === 'stems' ? plan.outputs.map(() => mk(1)) : [mk(nOut)];
-
-  const segs = plan.segs;
-  let next = 0;
-  let active: Seg[] = [];
-  for (let pos = 0; pos < total; pos += BLOCK) {
-    if (signal.aborted) throw new DOMException('aborted', 'AbortError');
-    const end = Math.min(total, pos + BLOCK);
-    const blockFrom = o.from + (pos * 1000) / RATE;
-    const blockTo = o.from + (end * 1000) / RATE;
-    while (next < segs.length && segs[next].startMs < blockTo) active.push(segs[next++]);
-    active = active.filter((s) => s.endMs > blockFrom);
-    // prefetch the next block's segments while mixing this one
-    for (let i = next; i < segs.length && segs[i].startMs < blockTo + 20000; i++) void audio.load(segs[i]);
-
-    const chans = Array.from({ length: nOut }, () => new Float32Array(end - pos));
-    const pcms = await Promise.all(active.map((s) => audio.load(s)));
-    active.forEach((s, i) => {
-      const pcm = pcms[i];
-      if (!pcm) return;
-      const g = gain(s);
-      if (!g) return;
-      const out = chans[outOf.get(trackKey(s.channelId, s.speakerId))!];
-      const start = Math.round(((s.startMs - o.from) * RATE) / 1000); // relative to range start
-      const a = Math.max(pos, start);
-      const b = Math.min(end, start + pcm.length);
-      for (let t = a; t < b; t++) out[t - pos] += pcm[t - start] * g;
-    });
-    if (o.layout === 'stems') await Promise.all(sinks.map((k, i) => k.write([chans[i]])));
-    else await sinks[0].write(chans);
-    onProgress(end / total);
-  }
-
-  if (o.layout === 'stems') {
-    const zip = new ZipWriter();
-    const ext = o.format === 'opus' ? 'opus' : 'wav';
-    const manifest = {
-      from: o.from,
-      to: o.to,
-      start: new Date(o.from).toISOString(),
-      sampleRate: RATE,
-      tracks: [] as { file: string; label: string }[],
+  const items: ExportItem[] = plan.segs
+    .map((s) => {
+      const u = fileUrl(s.path, s.offset !== null);
+      return {
+        startMs: s.startMs,
+        endMs: s.endMs,
+        out: outOf.get(trackKey(s.channelId, s.speakerId))!,
+        gain: o.applyMix ? trackGain(s.channelId, s.speakerId) : 1,
+        href: u.href,
+        cache: u.cache,
+        offset: s.offset,
+        size: s.size,
+      };
+    })
+    .sort((a, b) => a.startMs - b.startMs);
+  const job: ExportJob = {
+    from: o.from,
+    to: o.to,
+    format: o.format,
+    split: plan.split,
+    labels: plan.outputs.map((x) => x.label),
+    filename: plan.filename,
+    items,
+  };
+  return new Promise((resolve, reject) => {
+    const w = new Worker(new URL('./export.worker.ts', import.meta.url), { type: 'module' });
+    const stop = () => {
+      w.terminate();
+      reject(new DOMException('aborted', 'AbortError'));
     };
-    for (let i = 0; i < nOut; i++) {
-      const safe = plan.outputs[i].label.replace(/[^\p{L}\p{N}._-]+/gu, '_').slice(0, 60);
-      const file = `${String(i + 1).padStart(2, '0')}_${safe}.${ext}`;
-      manifest.tracks.push({ file, label: plan.outputs[i].label });
-      zip.add(file, await sinks[i].finish(total));
-    }
-    zip.add('manifest.json', [new TextEncoder().encode(JSON.stringify(manifest, null, 2)) as Uint8Array<ArrayBuffer>]);
-    return { blob: new Blob(zip.finish(), { type: 'application/zip' }), filename: plan.filename };
-  }
-  const parts = await sinks[0].finish(total);
-  const type = o.format === 'opus' ? 'audio/ogg' : 'audio/wav';
-  return { blob: new Blob(parts, { type }), filename: plan.filename };
+    signal.addEventListener('abort', stop, { once: true });
+    const done = () => {
+      signal.removeEventListener('abort', stop);
+      w.terminate();
+    };
+    w.onmessage = (e: MessageEvent<ExportMessage>) => {
+      const m = e.data;
+      if ('progress' in m) onProgress(m.progress);
+      else if ('blob' in m) {
+        done();
+        resolve(m);
+      } else {
+        done();
+        reject(new Error(m.error));
+      }
+    };
+    w.onerror = (e) => {
+      done();
+      reject(new Error(e.message || 'export worker failed'));
+    };
+    w.postMessage(job);
+  });
 }
 
 export function download(blob: Blob, filename: string) {

@@ -8,7 +8,6 @@
 //! without a row are recovered from their name and Ogg length.
 
 use crate::config::Config;
-use crate::live::Live;
 use crate::ogg::OggOpusWriter;
 use crate::opus;
 use crate::store::Store;
@@ -72,7 +71,7 @@ struct Open {
 }
 
 impl Recorder {
-    pub fn spawn(cfg: Arc<Config>, store: Arc<Store>, live: Arc<Live>, transcode: UnboundedSender<i64>) -> Self {
+    pub fn spawn(cfg: Arc<Config>, store: Arc<Store>, transcode: UnboundedSender<i64>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
         std::thread::Builder::new()
             .name("segment-writer".into())
@@ -116,14 +115,14 @@ impl Recorder {
                         }
                         Cmd::Close { key } => {
                             if let Some(o) = open.remove(&key) {
-                                close(&cfg, &store, &live, &transcode, o);
+                                close(&cfg, &store, &transcode, o);
                             }
                         }
                     }
                 }
                 // Channel closed (shutdown): finish everything still open.
                 for (_, o) in open.drain() {
-                    close(&cfg, &store, &live, &transcode, o);
+                    close(&cfg, &store, &transcode, o);
                 }
             })
             .expect("spawn segment writer");
@@ -151,7 +150,7 @@ impl Recorder {
     }
 }
 
-fn close(cfg: &Config, store: &Store, live: &Live, transcode: &UnboundedSender<i64>, o: Open) {
+fn close(cfg: &Config, store: &Store, transcode: &UnboundedSender<i64>, o: Open) {
     if let Some(w) = o.writer {
         if let Err(e) = w.finish() {
             tracing::error!("finish {}: {e}", o.path.display());
@@ -167,8 +166,6 @@ fn close(cfg: &Config, store: &Store, live: &Live, transcode: &UnboundedSender<i
     match store.insert_raw_segment(m.speaker, m.channel, m.session, m.target, m.start_ms, m.start_ms + dur_ms, o.samples, &o.rel, size) {
         Ok(id) => {
             let _ = store.touch_speaker(m.speaker, m.start_ms + dur_ms);
-            live.touch_speakers();
-            live.touch_day(m.start_ms);
             let _ = transcode.send(id);
         }
         Err(e) => tracing::error!("store segment {}: {e:#}", o.rel),

@@ -122,6 +122,8 @@ impl ExportEncoder {
         let mut enc = Encoder::new(RATE, ch, Application::Voip)?;
         enc.set_bitrate(Bitrate::Bits(bitrate_bps))?;
         enc.set_vbr(true)?;
+        // Exported tracks are mostly silence between clips: DTX makes it nearly free.
+        enc.set_dtx(true)?;
         let pre_skip = enc.get_lookahead()?.max(0) as usize;
         Ok(Self { enc, channels, pre_skip, pending: vec![], out: vec![0u8; 4000] })
     }

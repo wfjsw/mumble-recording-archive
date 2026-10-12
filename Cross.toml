@@ -1,0 +1,32 @@
+# cross (https://github.com/cross-rs/cross) build configuration.
+#
+# Recommended release builds are the static musl targets: the binary has no
+# runtime dependencies (no glibc version requirement), uses TCMalloc, and runs
+# on any Linux of that architecture.
+#
+#   cross build --release --target x86_64-unknown-linux-musl
+#   cross build --release --target aarch64-unknown-linux-musl
+#
+# Why these images:
+# - libopus is compiled from source and needs GCC >= 9 for its SSE4.1/AVX2
+#   code; cross 0.2.5's default *-gnu images ship GCC 5 and fail with
+#   "incompatible types when assigning to type '__m256i'".
+# - All targets use the same base (the :main images, Ubuntu 24.04). Build
+#   scripts are compiled once into the shared target/release/build and reused
+#   across targets; a script built in a newer image cannot run in an older one
+#   ("GLIBC_2.28 not found"). After switching images, `cargo clean` once.
+
+# musl: GCC 9.2 cross toolchain, fully static output.
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
+
+# glibc builds (GCC 13) work too, but the binary then requires glibc >= 2.39
+# on the target host. Prefer the musl targets above for deployment.
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main"
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"

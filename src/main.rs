@@ -14,8 +14,18 @@ const USAGE: &str = "usage:
         [--channels 1,2] [--speakers 3,4] [--config config.toml]
       <time> is unix ms or local 'YYYY-MM-DD HH:MM[:SS]'";
 
+#[cfg(all(target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[global_allocator]
+static GLOBAL: tcmalloc_better::TCMalloc = tcmalloc_better::TCMalloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // TCMalloc returns freed memory to the OS from a background thread.
+    #[cfg(all(target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    std::thread::Builder::new()
+        .name("tcmalloc-bg".into())
+        .spawn(tcmalloc_better::TCMalloc::process_background_actions_thread)?;
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
@@ -46,13 +56,10 @@ async fn main() -> Result<()> {
 
 
     let store = Arc::new(store::Store::open(&cfg.recording.data_dir.join("archive.db"))?);
-    let live = Arc::new(live::Live::new());
-    let publisher = Arc::new(live::Publisher { cfg: cfg.clone(), store: store.clone(), live: live.clone() });
-
     match cmd.as_str() {
-        "run" => run(cfg, store, live, publisher).await,
+        "run" => run(cfg, store).await,
         "republish" => {
-            publisher.rebuild(true)?;
+            live::Publisher::rebuild(cfg.clone(), store)?;
             println!("rebuilt static indexes in {}", cfg.public_dir().display());
             Ok(())
         }
@@ -61,20 +68,21 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run(cfg: Arc<config::Config>, store: Arc<store::Store>, live: Arc<live::Live>, publisher: Arc<live::Publisher>) -> Result<()> {
+async fn run(cfg: Arc<config::Config>, store: Arc<store::Store>) -> Result<()> {
     store.close_dangling()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let transcoder = Arc::new(transcode::Transcoder {
         cfg: cfg.clone(),
         store: store.clone(),
-        live: live.clone(),
         pack_lock: Default::default(),
     });
     transcoder.recover(&tx)?;
     mumble_archive::recorder::recover_orphans(&cfg, &store, &tx)?;
     tokio::spawn(transcoder.run(rx));
-    tokio::spawn(transcode::retention(cfg.clone(), store.clone(), live.clone()));
-    publisher.rebuild(false)?;
+    let publisher = Arc::new(live::Publisher::open(cfg.clone(), store.clone())?);
+    if let Err(e) = publisher.tick() {
+        tracing::error!("publish: {e:#}");
+    }
     tokio::spawn(publisher.run());
 
     let identity = mumble::load_or_create_identity(
@@ -82,8 +90,8 @@ async fn run(cfg: Arc<config::Config>, store: Arc<store::Store>, live: Arc<live:
         &cfg.data_path(&cfg.mumble.key_file),
         &cfg.mumble.username,
     )?;
-    let recorder = mumble_archive::recorder::Recorder::spawn(cfg.clone(), store.clone(), live.clone(), tx);
-    let bot = Arc::new(bot::Bot { cfg: cfg.clone(), store, live, recorder, identity });
+    let recorder = mumble_archive::recorder::Recorder::spawn(cfg.clone(), store.clone(), tx);
+    let bot = Arc::new(bot::Bot { cfg: cfg.clone(), store, recorder, identity });
     tracing::info!("publishing static files to {}", cfg.public_dir().display());
     tokio::select! {
         _ = bot.run() => {}
@@ -127,7 +135,8 @@ async fn export_cli(cfg: Arc<config::Config>, store: Arc<store::Store>, o: &Hash
         eprintln!("warning: {w}");
     }
     let out_path = o.get("out").cloned().unwrap_or_else(|| plan.filename.clone());
-    let mut out = export::run(cfg, plan, req.format, req.layout == export::Layout::Stems);
+    let split = plan.split;
+    let mut out = export::run(cfg, plan, req.format, split);
     let mut f = tokio::fs::File::create(&out_path).await?;
     while let Some(chunk) = out.body.recv().await {
         f.write_all(&chunk?).await?;

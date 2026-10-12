@@ -1,8 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import type { DayEntry } from '../api';
 import { engine } from '../engine';
-import { catalog, ensureRange, segmentsIn, ui } from '../state';
+import { catalog, ensureRange, segmentsIn, ui, type CatalogDay } from '../state';
 import { clamp, fmtDur, MIN } from '../util';
 import ChannelTree from './ChannelTree.vue';
 import SpeakerList from './SpeakerList.vue';
@@ -11,7 +10,7 @@ import VirtualList from './VirtualList.vue';
 const days = computed(() => [...(catalog.value?.days ?? [])].reverse());
 const daysOpen = ref(true);
 
-async function openDay(d: DayEntry) {
+async function openDay(d: CatalogDay) {
   await ensureRange(d.from, d.to);
   const segs = segmentsIn(d.from, d.to);
   const a = segs.length ? segs[0].startMs : d.from;
@@ -46,11 +45,11 @@ function startResize(e: PointerEvent) {
       <header @click="daysOpen = !daysOpen">
         <h3>{{ daysOpen ? '▾' : '▸' }} Days <span class="dim">{{ days.length }}</span></h3>
       </header>
-      <VirtualList v-if="daysOpen" :items="days" :row-height="22" :key-of="(d: DayEntry) => d.day">
+      <VirtualList v-if="daysOpen" :items="days" :row-height="22" :key-of="(d: CatalogDay) => d.day">
         <template #default="{ item }">
           <div class="day" @click="openDay(item)">
             <span>{{ item.day }}</span>
-            <span class="dim">{{ fmtDur(item.totalMs) }}</span>
+            <span class="dim">{{ item.totalMs === null ? '' : fmtDur(item.totalMs) }}</span>
           </div>
         </template>
       </VirtualList>

@@ -1,0 +1,5 @@
+[env]
+# aarch64 musl only (cross builds): TCMalloc's ARM rseq code needs GCC >= 10,
+# the musl cross toolchain is GCC 9. Native and other targets are unaffected.
+CXXFLAGS_aarch64_unknown_linux_musl = "-DTCMALLOC_INTERNAL_PERCPU_USE_RSEQ=0"
+CFLAGS_aarch64_unknown_linux_musl = "-DTCMALLOC_INTERNAL_PERCPU_USE_RSEQ=0"

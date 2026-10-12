@@ -35,7 +35,7 @@ const sizeEstimate = computed(() => {
   const p = plan.value;
   if (!p) return '';
   const secs = (opts.to - opts.from) / 1000;
-  const ch = opts.layout === 'stems' ? p.outputs.length : Math.max(1, p.outputs.length);
+  const ch = Math.max(1, p.outputs.length);
   const bytes = opts.format === 'wav' ? secs * 48000 * 2 * ch : secs * 3000 * ch;
   return bytes > 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${(bytes / 1e6).toFixed(1)} MB`;
 });
@@ -76,8 +76,8 @@ function close() {
       <fieldset>
         <legend>Layout</legend>
         <label><input type="radio" value="downmix" v-model="opts.layout" /> <b>Downmix</b> — everything mixed to one mono track</label>
-        <label><input type="radio" value="tracks" v-model="opts.layout" /> <b>Multichannel</b> — one channel per speaker track</label>
-        <label><input type="radio" value="channels" v-model="opts.layout" /> <b>Per Mumble channel</b> — one channel per voice channel</label>
+        <label><input type="radio" value="tracks" v-model="opts.layout" /> <b>Multichannel</b> — one channel per speaker track (Opus: one file per track)</label>
+        <label><input type="radio" value="channels" v-model="opts.layout" /> <b>Per Mumble channel</b> — one channel per voice channel (Opus: one file per channel)</label>
         <label><input type="radio" value="stems" v-model="opts.layout" /> <b>Stems</b> — zip with one aligned mono file per track</label>
       </fieldset>
 

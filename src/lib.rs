@@ -7,6 +7,7 @@ pub mod mumble;
 pub mod ogg;
 pub mod opus;
 pub mod pack;
+pub mod publog;
 pub mod recorder;
 pub mod reorder;
 pub mod store;

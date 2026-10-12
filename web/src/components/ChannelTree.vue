@@ -164,7 +164,7 @@ const totalChannels = computed(() => tree.value.order.length);
       <template #default="{ item }">
         <div
           class="node"
-          :class="{ removed: item.node.channel.removedAt }"
+          :class="{ removed: item.node.channel.removed }"
           :style="{ paddingLeft: `${4 + Math.min(item.rel, MAX_INDENT_LEVELS) * INDENT}px` }"
           :title="item.node.path + (item.rel > MAX_INDENT_LEVELS ? ` (level ${item.node.depth})` : '')"
         >

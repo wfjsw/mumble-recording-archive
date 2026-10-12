@@ -44,3 +44,13 @@ protoc-bin-vendored = "3.3.0"
 [profile.release]
 lto = "thin"
 codegen-units = 4
+
+# Static musl builds use TCMalloc: musl's built-in allocator is slow under the
+# bot's multi-threaded load (voice loop, writer thread, transcode workers).
+[target.'cfg(all(target_env = "musl", target_arch = "x86_64"))'.dependencies]
+tcmalloc-better = "0.1"
+
+# The musl cross toolchain (GCC 9) cannot compile TCMalloc's ARM per-CPU (rseq)
+# fast path; use per-thread caches instead (rseq is disabled in .cargo/config.toml).
+[target.'cfg(all(target_env = "musl", target_arch = "aarch64"))'.dependencies]
+tcmalloc-better = { version = "0.1", features = ["deprecated_perthread"] }

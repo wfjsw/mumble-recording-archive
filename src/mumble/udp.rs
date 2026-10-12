@@ -63,6 +63,17 @@ fn bind_socket(server: SocketAddr) -> Result<UdpSocket> {
     s.set_nonblocking(true)?;
     let got = s.recv_buffer_size().unwrap_or(0);
     tracing::debug!("UDP: receive buffer {} KB", got / 1024);
+    if got < RECV_BUFFER / 2 {
+        // Linux caps SO_RCVBUF at net.core.rmem_max (often ~200 KB: well under a
+        // second of voice for a very busy server).
+        tracing::warn!(
+            "UDP: kernel granted a {} KB receive buffer ({} KB requested); for very busy servers \
+             raise the limit, e.g. 'sysctl -w net.core.rmem_max={}'",
+            got / 1024,
+            RECV_BUFFER / 1024,
+            RECV_BUFFER
+        );
+    }
     Ok(UdpSocket::from_std(s.into())?)
 }
 

@@ -7,7 +7,6 @@
 //! listen to) and never subscribes to anything by itself.
 
 use crate::config::Config;
-use crate::live::Live;
 use crate::mumble::crypt::CryptState;
 use crate::mumble::udp::{UdpEvent, VoiceLink};
 use crate::mumble::{self, kind, pb, AudioPacket, Connection, Identity};
@@ -29,7 +28,6 @@ pub fn now_ms() -> i64 {
 pub struct Bot {
     pub cfg: Arc<Config>,
     pub store: Arc<Store>,
-    pub live: Arc<Live>,
     pub recorder: Recorder,
     pub identity: Identity,
 }
@@ -202,8 +200,8 @@ impl Bot {
                 let _ = self.store.close_presence(p, now);
             }
         }
-        if let Some(id) = st.uptime {
-            let _ = self.store.touch_uptime(id, now);
+        if let Some(id) = st.uptime.take() {
+            let _ = self.store.close_uptime(id, now);
         }
     }
 
@@ -245,11 +243,9 @@ impl Bot {
                 if let Some(u) = st.users.remove(&me) {
                     st.self_channel = Some(u.channel);
                     self.store.forget_speaker_if_unused(u.speaker_id)?;
-                    self.live.touch_speakers();
                 }
                 let alive: Vec<i64> = st.channels.values().map(|c| c.internal).collect();
                 self.store.mark_channels_removed_except(&alive, now)?;
-                self.live.touch_channels();
                 st.uptime = Some(self.store.start_uptime(now, &self.cfg.mumble.address)?);
                 tracing::info!("synced: session {me}, {} channels, {} users", st.channels.len(), st.users.len());
 
@@ -291,13 +287,11 @@ impl Bot {
                     c.internal
                 };
                 st.channels.insert(id, ChannelInfo { internal, name, parent, position });
-                self.live.touch_channels();
             }
             kind::CHANNEL_REMOVE => {
                 let m = pb::ChannelRemove::decode(&f.payload[..])?;
                 if let Some(c) = st.channels.remove(&m.channel_id) {
                     self.store.remove_channel(c.internal, now)?;
-                    self.live.touch_channels();
                 }
             }
             kind::USER_STATE => {
@@ -405,7 +399,6 @@ impl Bot {
         }
 
         if is_new || ident_before != (u.name.clone(), u.user_id, u.hash.clone()) {
-            self.live.touch_speakers();
             u.speaker_id = self.store.upsert_speaker(
                 &Self::speaker_key(u),
                 &u.name,
@@ -419,7 +412,6 @@ impl Bot {
             if let Some((p, _)) = u.presence.take() {
                 self.store.close_presence(p, now)?;
             }
-            self.live.touch_day(now);
             if let Some(ci) = channel_internal {
                 let p = self.store.open_presence(u.speaker_id, ci, session, now)?;
                 u.presence = Some((p, ci));

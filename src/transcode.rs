@@ -4,10 +4,8 @@
 //! appended to a day pack, plus a coarse peak envelope for waveform display.
 //! All codec work is in-process (libopus) on blocking worker threads.
 
-use crate::bot::now_ms;
 use crate::codec::{self, SpeechEncoder};
 use crate::config::Config;
-use crate::live::Live;
 use crate::ogg;
 use crate::opus;
 use crate::pack::Record;
@@ -24,7 +22,6 @@ pub const PEAKS_PER_SEC: usize = 10;
 pub struct Transcoder {
     pub cfg: Arc<Config>,
     pub store: Arc<Store>,
-    pub live: Arc<Live>,
     pub pack_lock: std::sync::Mutex<()>,
 }
 
@@ -94,7 +91,6 @@ impl Transcoder {
             }
         };
         let _ = ids;
-        self.live.touch_day(seg.start_ms);
         Ok(())
     }
 
@@ -266,7 +262,7 @@ pub fn speech_regions(pcm: &[f32], threshold_db: f32, min_silence_ms: i64, pad_m
 }
 
 /// sqrt-scaled 8-bit peak envelope at PEAKS_PER_SEC.
-fn peaks(pcm: &[f32]) -> Vec<u8> {
+pub fn peaks(pcm: &[f32]) -> Vec<u8> {
     pcm.chunks(48_000 / PEAKS_PER_SEC).map(|c| peak_byte(c.iter().fold(0f32, |m, v| m.max(v.abs())))).collect()
 }
 
@@ -282,44 +278,6 @@ pub fn sanitize(s: &str) -> String {
         .take(48)
         .collect();
     if out.is_empty() { "_".into() } else { out }
-}
-
-/// Periodically delete recordings older than the configured retention.
-pub async fn retention(cfg: Arc<Config>, store: Arc<Store>, live: Arc<Live>) {
-    if cfg.recording.retention_days <= 0 {
-        return;
-    }
-    let mut iv = tokio::time::interval(std::time::Duration::from_secs(3600));
-    loop {
-        iv.tick().await;
-        let cutoff = now_ms() - cfg.recording.retention_days * 86_400_000;
-        loop {
-            let old = match store.segments_before(cutoff, 500) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!("retention: {e}");
-                    break;
-                }
-            };
-            if old.is_empty() {
-                break;
-            }
-            let mut paths = std::collections::BTreeSet::new();
-            for s in &old {
-                live.touch_day(s.start_ms);
-                let _ = store.delete_segment(s.id);
-                paths.extend(s.path.clone());
-            }
-            // Day packs are removed once no segment references them any more.
-            for p in paths {
-                if !store.path_in_use(&p).unwrap_or(true) {
-                    let _ = std::fs::remove_file(cfg.public_dir().join(&p));
-                }
-            }
-            tracing::info!("retention: deleted {} segments", old.len());
-        }
-        let _ = store.prune_presence_before(cutoff);
-    }
 }
 
 #[cfg(test)]

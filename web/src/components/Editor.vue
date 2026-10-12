@@ -9,6 +9,7 @@ import {
   channelPath,
   channelStrip,
   dataVersion,
+  dayList,
   ensureRange,
   presenceIn,
   segmentsIn,
@@ -47,9 +48,10 @@ const viewEnd = () => ui.view.start + ui.view.width * ui.view.msPerPx;
 const xOf = (t: number) => (t - ui.view.start) / ui.view.msPerPx;
 const tOf = (x: number) => ui.view.start + x * ui.view.msPerPx;
 
+// Also re-run when new days are published (e.g. the view spans midnight).
 watch(
-  scope,
-  (s) => {
+  [scope, dayList],
+  ([s]) => {
     void ensureRange(s.from, s.to);
   },
   { immediate: true },
@@ -307,7 +309,7 @@ const overviewRange = computed(() => {
   const d = startOfDay(mid);
   return { from: d, to: d + DAY };
 });
-watch(overviewRange, (r) => void ensureRange(r.from, r.to), { immediate: true });
+watch([overviewRange, dayList], ([r]) => void ensureRange(r.from, r.to), { immediate: true });
 
 function drawOverview() {
   const c = overview.value;

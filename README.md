@@ -6,15 +6,17 @@ play back and export them like a multitrack editor.
 
 ```
  Mumble server ──TLS──▶ mumble-archive (Rust bot) ──▶ data/public/  ◀── nginx ◀── browser (static UI)
-                        records voice it receives     catalog.json            HTML/JS/CSS + wasm Opus
-                        per-speaker segments          channels.json           decoder; reads JSON indexes,
-                        silence removed, VBR Opus     speakers.json           fetches audio by HTTP Range,
-                        SQLite (private)              index/<day>.json        mixes/exports client-side
+                        records voice it receives     meta.json               HTML/JS/CSS + wasm Opus
+                        per-speaker segments          days.log                decoder; reads the logs and
+                        silence removed, VBR Opus     channels.<gen>.log      audio by HTTP Range,
+                        SQLite (private)              index/<day>.log         mixes/exports client-side
                                                       audio/<month>/<day>.pack
 ```
 
-The bot runs no web server. It continuously (re)generates static files; any static
-host serves them together with the built UI.
+The bot runs no web server. It publishes static files that only ever grow by
+appending (index logs and audio packs); the UI reads just the new bytes with HTTP
+Range requests, so neither the bot's writes nor a refresh grow with the age of the
+archive. Any static host that supports Range serves them together with the built UI.
 
 ## Features
 
@@ -80,6 +82,19 @@ cargo build --release                  # target/release/mumble-archive
 cd web && npm ci && npm run build      # web/dist
 ```
 
+Linux release binaries are best built with [cross](https://github.com/cross-rs/cross) as
+**static musl executables**: no runtime dependencies, any distribution, and TCMalloc
+instead of musl's slower allocator. `Cross.toml` selects images whose compilers can
+build libopus and TCMalloc:
+
+```sh
+cross build --release --target x86_64-unknown-linux-musl    # target/x86_64-unknown-linux-musl/release/
+cross build --release --target aarch64-unknown-linux-musl
+```
+
+glibc targets (`*-unknown-linux-gnu`) build too, but the binary then needs glibc ≥ 2.39.
+If you built with cross's default images before, run `cargo clean` once.
+
 ## Run
 
 ```sh
@@ -117,7 +132,7 @@ cd web && DATA_TARGET=http://127.0.0.1:8088 npm run dev   # proxies /data to a s
 
 ```sh
 mumble-archive [--config config.toml]           # run the bot
-mumble-archive republish                        # rebuild all static index files
+mumble-archive republish                        # rebuild all published logs from the database (stop the bot first)
 mumble-archive export --from "2026-10-11 20:00" --to "2026-10-11 21:30" \
     --layout downmix|tracks|channels|stems --format wav|flac|opus \
     [--channels 3,4] [--speakers 7] --out meeting.flac
@@ -145,6 +160,8 @@ simultaneous speakers. Anything beyond is queued safely on disk and processed la
 
 ## Mumble server notes
 
+- On Linux, very busy servers benefit from a larger UDP socket buffer than the kernel
+  default: `sysctl -w net.core.rmem_max=8388608` (the bot warns when it is limited).
 - UDP voice uses the server's regular port (UDP 64738 by default). If UDP is blocked
   between bot and server, voice keeps flowing over TCP; set `mumble.udp = false` to
   skip UDP entirely. With `RUST_LOG=mumble_archive=debug` the bot logs which
@@ -160,11 +177,11 @@ data/
   bot-cert.pem/.key     bot identity (private)
   tmp/
   public/               ← publish this directory
-    catalog.json        stats + list of days
-    channels.json       [id, mumbleId, parentId, name, position, removedAt]
-    speakers.json       [id, name, userId, firstSeen, lastSeen]
-    index/YYYY-MM-DD.json   segments [id, speaker, channel, startMs, durMs, target,
-                            status, path, offset, size, peaks], presence, uptime
+    meta.json           server info, format version, current log names (rarely written)
+    days.log            days with data; per-day totals once a day is over
+    channels.<gen>.log  live channel tree (compacted into a new generation when it grows)
+    index/YYYY-MM-DD.log    one day: the speakers and channels it mentions, segments
+                            (with waveform peaks), presence, bot sessions
     audio/YYYY-MM/YYYY-MM-DD.pack
     raw/                in-progress bursts (Ogg Opus), removed after processing
 ```
@@ -179,6 +196,31 @@ packetCount × (varint len, Opus packet)
 
 Each record is self-describing (speaker, channel and timestamp are inside it), so a
 pack can be re-indexed without the database.
+
+The `.log` files are append-only (`src/publog.rs`):
+
+```
+"MAL1"  record*        record = varint len, type byte, fields
+```
+
+Fields are LEB128 varints (zigzag for signed), strings/blobs are length-prefixed.
+The bot never rewrites a log: it appends records (later definitions of the same
+speaker/channel replace earlier ones), and a reader keeps the length it has parsed
+and asks for `Range: bytes=<length>-` next time (`416` = nothing new). Incomplete
+trailing records are ignored by readers and truncated by the bot after a crash. Day
+logs carry their own speaker and channel names, so there is no global speaker list
+and removed channels never pile up in the live channel tree; the channel log is
+rewritten into a new generation (announced by a `NEXT` record and `meta.json`) only
+when edits have made it several times larger than the live tree. Serve `.log` files
+without gzip (compression disables Range); they are compact binary already.
+
+Caching: once a day is over, its log and pack only change if a late clip arrives,
+which also publishes a new day summary. The UI therefore requests a finished
+day's files as `<file>?v=<summary>`; serve requests with `v` with a long
+`max-age, immutable` and everything else with `no-cache` (see
+`deploy/nginx.conf`). Waveform peaks live only in the day logs; the database
+drops them once a clip is published (`republish` reuses them from the existing
+logs, or recomputes them from the audio).
 
 ## Testing
 

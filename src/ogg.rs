@@ -28,7 +28,10 @@ pub struct OggOpusWriter<W: Write> {
     serial: u32,
     seq: u32,
     granule: i64,
-    pending: Option<(Vec<u8>, i64)>,
+    /// Packets not yet written, with the granule after each.
+    pending: Vec<(Vec<u8>, i64)>,
+    /// Packets per page (1 = a page per packet, e.g. for crash-safe live files).
+    per_page: usize,
     end_granule: Option<i64>,
 }
 
@@ -54,20 +57,32 @@ impl<W: Write> OggOpusWriter<W> {
         tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
         tags.extend_from_slice(vendor.as_bytes());
         tags.extend_from_slice(&0u32.to_le_bytes());
-        let mut me = Self { w, serial, seq: 0, granule: 0, pending: None, end_granule: None };
-        me.write_page(&head, 0, 0x02)?;
-        me.write_page(&tags, 0, 0x00)?;
+        let mut me = Self { w, serial, seq: 0, granule: 0, pending: vec![], per_page: 1, end_granule: None };
+        me.write_page(&[&head], 0, 0x02)?;
+        me.write_page(&[&tags], 0, 0x00)?;
         me.w.flush()?;
         Ok(me)
     }
 
-    fn write_page(&mut self, packet: &[u8], granule: i64, flags: u8) -> io::Result<()> {
-        let mut lacing = vec![255u8; packet.len() / 255];
-        lacing.push((packet.len() % 255) as u8);
-        if lacing.len() > 255 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "packet too large for one page"));
+    /// Put up to `n` packets on one page (fewer if they need more than 255
+    /// lacing values). Pages carry ~27 bytes of overhead, which is large next to
+    /// short or silent (DTX) packets.
+    pub fn packets_per_page(mut self, n: usize) -> Self {
+        self.per_page = n.max(1);
+        self
+    }
+
+    fn write_page(&mut self, packets: &[&[u8]], granule: i64, flags: u8) -> io::Result<()> {
+        let mut lacing = vec![];
+        for p in packets {
+            lacing.extend(std::iter::repeat_n(255u8, p.len() / 255));
+            lacing.push((p.len() % 255) as u8);
         }
-        let mut page = Vec::with_capacity(27 + lacing.len() + packet.len());
+        if lacing.len() > 255 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "packets too large for one page"));
+        }
+        let body: usize = packets.iter().map(|p| p.len()).sum();
+        let mut page = Vec::with_capacity(27 + lacing.len() + body);
         page.extend_from_slice(b"OggS");
         page.push(0);
         page.push(flags);
@@ -77,26 +92,50 @@ impl<W: Write> OggOpusWriter<W> {
         page.extend_from_slice(&[0, 0, 0, 0]);
         page.push(lacing.len() as u8);
         page.extend_from_slice(&lacing);
-        page.extend_from_slice(packet);
+        for p in packets {
+            page.extend_from_slice(p);
+        }
         let c = crc(&page);
         page[22..26].copy_from_slice(&c.to_le_bytes());
         self.seq += 1;
         self.w.write_all(&page)
     }
 
-    fn flush_pending(&mut self, flags: u8) -> io::Result<()> {
-        if let Some((pkt, g)) = self.pending.take() {
-            self.write_page(&pkt, g, flags)?;
+    /// Write the first `n` pending packets as pages (each page ends on a packet).
+    fn flush_pending(&mut self, n: usize, last_flags: u8) -> io::Result<()> {
+        let mut done = 0;
+        while done < n {
+            let mut end = done;
+            let mut laces = 0;
+            while end < n && end - done < self.per_page {
+                let l = self.pending[end].0.len() / 255 + 1;
+                if laces + l > 255 && end > done {
+                    break;
+                }
+                laces += l;
+                end += 1;
+            }
+            let granule = self.pending[end - 1].1;
+            let pkts: Vec<Vec<u8>> = self.pending[done..end].iter().map(|p| p.0.clone()).collect();
+            let refs: Vec<&[u8]> = pkts.iter().map(|p| p.as_slice()).collect();
+            let flags = if end == n { last_flags } else { 0 };
+            self.write_page(&refs, granule, flags)?;
+            done = end;
         }
+        self.pending.drain(..n);
         Ok(())
     }
 
-    /// Append one Opus packet carrying `samples` 48 kHz samples.
-    /// Packets are written one per page, delayed by one so the final page can carry EOS.
+    /// Append one Opus packet carrying `samples` 48 kHz samples. Pages are
+    /// written once `per_page` packets wait, keeping the last one back so the
+    /// final page can carry EOS.
     pub fn write_packet(&mut self, pkt: &[u8], samples: i64) -> io::Result<()> {
-        self.flush_pending(0)?;
+        if self.pending.len() > self.per_page {
+            let n = self.pending.len() - 1;
+            self.flush_pending(n, 0)?;
+        }
         self.granule += samples;
-        self.pending = Some((pkt.to_vec(), self.granule));
+        self.pending.push((pkt.to_vec(), self.granule));
         Ok(())
     }
 
@@ -110,10 +149,16 @@ impl<W: Write> OggOpusWriter<W> {
     }
 
     pub fn finish(mut self) -> io::Result<W> {
-        if let (Some(end), Some((_, g))) = (self.end_granule, self.pending.as_mut()) {
+        if let (Some(end), Some((_, g))) = (self.end_granule, self.pending.last_mut()) {
             *g = end.min(*g);
         }
-        self.flush_pending(0x04)?;
+        if self.pending.is_empty() {
+            // EOS needs a page; an empty one is valid.
+            self.write_page(&[], self.granule, 0x04)?;
+        } else {
+            let n = self.pending.len();
+            self.flush_pending(n, 0x04)?;
+        }
         self.w.flush()?;
         Ok(self.w)
     }
@@ -180,6 +225,20 @@ fn all_packets(data: &[u8]) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouped_pages_roundtrip() {
+        let mut w = OggOpusWriter::new(Vec::new(), 7, "test").unwrap().packets_per_page(50);
+        let pkts: Vec<Vec<u8>> = (0..123).map(|i| vec![0xF8; 1 + (i * 37) % 600]).collect();
+        for p in &pkts {
+            w.write_packet(p, 960).unwrap();
+        }
+        let buf = w.finish().unwrap();
+        assert_eq!(read_opus_packets(&buf), pkts);
+        assert_eq!(last_granule(&buf[..]).unwrap(), 123 * 960);
+        // far fewer pages than packets
+        assert!(buf.windows(4).filter(|w| w == b"OggS").count() < 20);
+    }
 
     #[test]
     fn write_and_measure() {

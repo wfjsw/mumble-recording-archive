@@ -112,6 +112,8 @@ pub struct Plan {
     pub speech_ms: i64,
     pub filename: String,
     pub warnings: Vec<String>,
+    /// One file per output channel (zip) instead of one multichannel file.
+    pub split: bool,
     #[serde(skip)]
     items: Vec<(Segment, usize, f32)>,
 }
@@ -123,16 +125,19 @@ pub fn plan(store: &Store, req: &Request) -> Result<Plan> {
     if req.to - req.from > 24 * 3_600_000 {
         bail!("range longer than 24h");
     }
-    let segs = store.segments(req.from, req.to, &req.filter, false)?;
+    let segs = store.segments(req.from, req.to, &req.filter)?;
     let mut track_keys: Vec<(i64, i64)> = segs.iter().map(|s| (s.channel_id, s.speaker_id)).collect();
     track_keys.sort();
     track_keys.dedup();
 
-    let speaker_names: BTreeMap<i64, String> = store.speakers()?.into_iter().map(|s| (s.id, s.name)).collect();
+    let mut speaker_names = BTreeMap::new();
     let mut chan_names = BTreeMap::new();
-    for (c, _) in &track_keys {
+    for (c, s) in &track_keys {
         if !chan_names.contains_key(c) {
             chan_names.insert(*c, store.channel_path(*c)?);
+        }
+        if !speaker_names.contains_key(s) {
+            speaker_names.insert(*s, store.speaker_name(*s)?);
         }
     }
     let track_label = |(c, s): (i64, i64)| {
@@ -161,7 +166,10 @@ pub fn plan(store: &Store, req: &Request) -> Result<Plan> {
     if channels.is_empty() {
         warnings.push("no recordings in the selected range — output will be silent".into());
     }
-    if req.layout != Layout::Stems && channels.len() > req.format.max_channels() {
+    // Multichannel Opus (more than stereo) is poorly supported by players and
+    // editors, so multichannel layouts in Opus become one file per output channel.
+    let split = req.layout == Layout::Stems || (req.format == Format::Opus && matches!(req.layout, Layout::Tracks | Layout::Channels));
+    if !split && channels.len() > req.format.max_channels() {
         bail!("{} supports at most {} channels, selection has {}", req.format.ext(), req.format.max_channels(), channels.len());
     }
     let mut out_of: BTreeMap<(i64, i64), usize> = BTreeMap::new();
@@ -186,7 +194,7 @@ pub fn plan(store: &Store, req: &Request) -> Result<Plan> {
         Layout::Channels => "channels",
         Layout::Stems => "stems",
     };
-    let ext = if req.layout == Layout::Stems { "zip" } else { req.format.ext() };
+    let ext = if split { "zip" } else { req.format.ext() };
     let filename = format!("mumble_{}_{}s_{layout}.{ext}", start.format("%Y%m%d-%H%M%S"), (req.to - req.from) / 1000);
     Ok(Plan {
         from: req.from,
@@ -198,6 +206,7 @@ pub fn plan(store: &Store, req: &Request) -> Result<Plan> {
         speech_ms,
         filename,
         warnings,
+        split,
         items,
     })
 }
@@ -354,7 +363,8 @@ fn encode_flac(rx: mpsc::Receiver<Vec<f32>>, nch: usize) -> Result<Vec<u8>> {
 
 async fn encode_opus(mut blocks: mpsc::Receiver<Vec<f32>>, nch: usize) -> Result<Vec<u8>> {
     let mut enc = ExportEncoder::new(nch, 32_000 * nch as i32)?;
-    let mut w = OggOpusWriter::with_head(Vec::new(), rand_serial(), "mumble-archive", nch as u8, enc.pre_skip as u16)?;
+    // ~1 s per page: per-page overhead would otherwise dominate silent stretches.
+    let mut w = OggOpusWriter::with_head(Vec::new(), rand_serial(), "mumble-archive", nch as u8, enc.pre_skip as u16)?.packets_per_page(50);
     let mut frames = 0i64;
     while let Some(b) = blocks.recv().await {
         frames += (b.len() / nch) as i64;
@@ -408,7 +418,7 @@ pub fn run(cfg: Arc<Config>, plan: Plan, format: Format, stems: bool) -> Output 
                     "from": plan.from, "to": plan.to, "start": date, "sampleRate": RATE,
                     "tracks": plan.channels.iter().map(|c| serde_json::json!({
                         "file": format!("{:02}_{}.{}", c.index + 1, sanitize(&c.label), format.ext()),
-                        "label": c.label, "channelId": c.tracks[0].0, "speakerId": c.tracks[0].1,
+                        "label": c.label, "tracks": c.tracks.iter().map(|t| serde_json::json!({ "channelId": t.0, "speakerId": t.1 })).collect::<Vec<_>>(),
                     })).collect::<Vec<_>>(),
                 });
                 zip.add_file("manifest.json", serde_json::to_vec_pretty(&manifest)?.into()).await?;
