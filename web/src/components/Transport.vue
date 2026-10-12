@@ -2,7 +2,7 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue';
 import { engine } from '../engine';
 import { isAudible, nextSegment, prevSegment, ui } from '../state';
-import { clamp, fmtClock, fmtDate, fmtDur, startOfDay, DAY } from '../util';
+import { addDays, clamp, fmtClock, fmtDate, fmtDur, startOfDay, DAY } from '../util';
 
 const level = ref(0);
 let raf = 0;
@@ -51,7 +51,7 @@ function fitSelection() {
 
 function fitDay() {
   const d = startOfDay(ui.playhead);
-  ui.view.msPerPx = DAY / ui.view.width;
+  ui.view.msPerPx = (addDays(d, 1) - d) / ui.view.width;
   ui.view.start = d;
 }
 

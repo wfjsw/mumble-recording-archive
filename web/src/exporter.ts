@@ -13,7 +13,7 @@ import {
   trackGain,
   trackKey,
 } from './state';
-import { HOUR } from './util';
+import { fmtStamp, HOUR } from './util';
 
 export type Layout = 'downmix' | 'tracks' | 'channels' | 'stems';
 export type Format = 'wav' | 'opus';
@@ -46,8 +46,6 @@ export interface Plan {
 }
 
 export const opusSupported = typeof (globalThis as any).AudioEncoder !== 'undefined';
-
-const pad = (n: number) => String(n).padStart(2, '0');
 
 /**
  * Stems are always separate files. Multichannel layouts in Opus are too:
@@ -96,8 +94,7 @@ export async function makePlan(o: ExportOptions): Promise<Plan> {
     warnings.push('Multichannel WAV: channel N = track N (no speaker positions). Audacity/Audition import it as separate tracks.');
   }
   const speechMs = segs.reduce((a, s) => a + Math.min(s.endMs, o.to) - Math.max(s.startMs, o.from), 0);
-  const d = new Date(o.from);
-  const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  const stamp = fmtStamp(o.from);
   const ext = split ? 'zip' : o.format === 'opus' ? 'opus' : 'wav';
   const name = { downmix: 'downmix', tracks: 'multitrack', channels: 'channels', stems: 'stems' }[o.layout];
   const filename = `mumble_${stamp}_${Math.round((o.to - o.from) / 1000)}s_${name}.${ext}`;

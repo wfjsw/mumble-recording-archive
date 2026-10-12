@@ -8,7 +8,7 @@ import {
   trackKey,
   ui,
 } from './state';
-import { DAY, startOfDay } from './util';
+import { addDays, DAY, startOfDay } from './util';
 
 export const RULER_H = 30;
 export const TRACK_H = 58;
@@ -26,11 +26,23 @@ export interface Row {
   speakers: number[];
 }
 
-/** Days around the view: lanes stay stable while scrolling within them. */
+let sticky = { from: 0, to: 0 };
+
+/**
+ * Whole days around the view, which decide the lanes: lanes stay put while
+ * scrolling within those days. The scope is sticky: zooming in towards a day
+ * boundary keeps the days already shown instead of dropping one (which would
+ * remove its lanes and shift the rest under the cursor). It is replaced when
+ * the view leaves it, or when it is much wider than the view needs.
+ */
 export const scope = computed(() => {
+  const end = ui.view.start + ui.view.width * ui.view.msPerPx;
   const from = startOfDay(ui.view.start);
-  const to = startOfDay(ui.view.start + ui.view.width * ui.view.msPerPx) + DAY;
-  return { from, to };
+  const to = addDays(startOfDay(Math.max(from, end - 1)), 1);
+  const s = sticky;
+  if (from >= s.from && to <= s.to && s.to - s.from <= to - from + 2 * DAY) return s;
+  sticky = { from, to };
+  return sticky;
 });
 
 export const rows = computed<Row[]>(() => {

@@ -30,6 +30,8 @@ import {
   fmtTick,
   speakerColor,
   startOfDay,
+  addDays,
+  timeZone,
   tickStep,
 } from '../util';
 
@@ -75,6 +77,7 @@ watch(
     JSON.stringify(ui.mix),
     ui.hiddenChannels.size,
     ui.hiddenSpeakers.size,
+    timeZone.value,
   ],
   invalidate,
 );
@@ -307,7 +310,7 @@ const overviewRange = computed(() => {
   if (span > 12 * HOUR) return { from: ui.view.start - span, to: ui.view.start + 2 * span };
   const mid = ui.view.start + span / 2;
   const d = startOfDay(mid);
-  return { from: d, to: d + DAY };
+  return { from: d, to: addDays(d, 1) };
 });
 watch([overviewRange, dayList], ([r]) => void ensureRange(r.from, r.to), { immediate: true });
 

@@ -65,6 +65,30 @@ input[type='date'] {
   font: inherit;
 }
 
+select {
+  appearance: none;
+  background: #15161a
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%238d909b' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    no-repeat right 8px center;
+  color: var(--text);
+  border: 1px solid #3a3d46;
+  border-radius: 5px;
+  padding: 4px 26px 4px 8px;
+  font: inherit;
+  cursor: pointer;
+}
+select:hover {
+  border-color: #4a4e59;
+}
+select:focus-visible {
+  outline: 1px solid #7aa2ff;
+  outline-offset: 0;
+}
+select option {
+  background: var(--panel);
+  color: var(--text);
+}
+
 input[type='range'] {
   accent-color: #7aa2ff;
 }

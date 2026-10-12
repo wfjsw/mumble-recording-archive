@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import { catalog, refreshCatalog, ui } from '../state';
-import { fmtBytes, fmtDateTime, fmtDur, startOfDay, DAY } from '../util';
+import { addDays, browserZone, fmtBytes, fmtDate, fmtDateTime, fmtDur, setTimeZone, timeZone, zonedTime, zoneNames } from '../util';
 import { engine } from '../engine';
 
 const stats = computed(() => catalog.value?.stats);
@@ -12,13 +12,11 @@ const ratio = computed(() => {
   return `${kbps.toFixed(1)} kbps avg`;
 });
 
+/** Day shown in the date picker: the day at the middle of the view (display zone). */
 const date = ref('');
 watch(
-  () => ui.view.start,
-  (t) => {
-    const d = new Date(t + (ui.view.width * ui.view.msPerPx) / 2);
-    date.value = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-  },
+  () => [ui.view.start, timeZone.value],
+  () => (date.value = fmtDate(ui.view.start + (ui.view.width * ui.view.msPerPx) / 2)),
   { immediate: true },
 );
 
@@ -26,18 +24,24 @@ watch(
 function shiftDay(n: number) {
   const [y, m, d] = date.value.split('-').map(Number);
   if (!y) return;
-  const t = new Date(y, m - 1, d + n);
-  date.value = `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+  // calendar arithmetic only (no zone involved)
+  date.value = new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
   goDate();
 }
 
 function goDate() {
   const [y, m, d] = date.value.split('-').map(Number);
   if (!y) return;
-  const t = new Date(y, m - 1, d).getTime();
-  ui.view.msPerPx = DAY / ui.view.width;
-  ui.view.start = startOfDay(t);
+  const t = zonedTime(y, m, d);
+  ui.view.msPerPx = (addDays(t, 1) - t) / ui.view.width;
+  ui.view.start = t;
 }
+
+const zones = zoneNames();
+const zone = computed({
+  get: () => timeZone.value,
+  set: (v: string) => setTimeZone(v),
+});
 
 function latest() {
   const t = stats.value?.latestMs;
@@ -64,6 +68,11 @@ function latest() {
       <span :title="`original stream ${fmtBytes(stats.rawBytes)}`">{{ fmtBytes(stats.bytes) }} stored · {{ ratio }}</span>
     </div>
     <div class="spacer" />
+    <select v-model="zone" class="zone" title="Time zone for dates and clocks">
+      <option value="">Browser ({{ browserZone }})</option>
+      <option value="UTC">UTC</option>
+      <option v-for="z in zones" :key="z" :value="z">{{ z }}</option>
+    </select>
     <div class="datenav">
       <button @click="shiftDay(-1)" title="Previous day">‹</button>
       <input type="date" v-model="date" @change="goDate" title="Go to day" />
@@ -108,6 +117,9 @@ function latest() {
 }
 .spacer {
   flex: 1;
+}
+.zone {
+  max-width: 190px;
 }
 .datenav {
   display: flex;

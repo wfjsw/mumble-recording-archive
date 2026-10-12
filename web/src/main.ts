@@ -8,4 +8,5 @@ createApp(App).mount('#root');
 import { engine } from './engine';
 import { ui } from './state';
 import * as exporter from './exporter';
-(window as any).__archive = { engine, ui, exporter };
+import { rows } from './rows';
+(window as any).__archive = { engine, ui, exporter, rows };
