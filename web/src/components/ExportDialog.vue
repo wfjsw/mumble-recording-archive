@@ -67,8 +67,8 @@ function close() {
     <div class="dialog">
       <h2>Export</h2>
       <div class="range">
-        <div><span class="dim">From</span> {{ fromText }}</div>
-        <div><span class="dim">To</span> {{ toText }}</div>
+        <div><span class="dim">From</span> <span class="mono">{{ fromText }}</span></div>
+        <div><span class="dim">To</span> <span class="mono">{{ toText }}</span></div>
         <div><span class="dim">Length</span> {{ fmtDur(opts.to - opts.from) }}</div>
         <div class="dim small" v-if="!ui.selection">No selection — exporting the visible range. Drag on the timeline to choose a range.</div>
       </div>

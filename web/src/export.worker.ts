@@ -2,7 +2,7 @@
 // them sample-accurately, mixes them into the requested outputs and encodes
 // WAV / Opus (one multichannel file, or a zip of aligned mono files).
 
-import { Decoder, fetchRangeUrl, fetchUrl, groupRanges, parse, RATE } from './codec';
+import { Decoder, ENHANCED, fetchRangeUrl, fetchUrl, groupRanges, parse, PLAIN, RATE } from './codec';
 import { OggOpusWriter, ZipWriter, toPcm16, wavHeader } from './encode';
 
 export interface ExportItem {
@@ -25,6 +25,8 @@ export interface ExportJob {
   split: boolean;
   labels: string[];
   filename: string;
+  /** Decode with speech enhancement (as in playback). */
+  enhance: boolean;
   /** Sorted by start. */
   items: ExportItem[];
 }
@@ -41,10 +43,11 @@ const post = (m: ExportMessage) => (self as unknown as Worker).postMessage(m);
 
 const decoder = new Decoder();
 let decodeChain: Promise<unknown> = Promise.resolve();
+let complexity = ENHANCED;
 const pcm = new Map<ExportItem, Promise<Float32Array | null>>();
 
 function decode(kind: 'record' | 'ogg', bytes: Uint8Array): Promise<Float32Array | null> {
-  const job = decodeChain.then(() => decoder.decode(parse(kind, bytes))).catch(() => null);
+  const job = decodeChain.then(() => decoder.decode(parse(kind, bytes), complexity)).catch(() => null);
   decodeChain = job;
   return job;
 }
@@ -148,6 +151,7 @@ function opusSink(channels: number): Sink {
 // ---------- rendering ----------
 
 async function run(job: ExportJob): Promise<{ blob: Blob; filename: string }> {
+  complexity = job.enhance ? ENHANCED : PLAIN;
   const total = Math.round(((job.to - job.from) * RATE) / 1000);
   const nOut = job.labels.length;
   const mk = (ch: number) => (job.format === 'opus' ? opusSink(ch) : wavSink(ch));

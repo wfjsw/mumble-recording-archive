@@ -1,14 +1,41 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import * as audio from '../audio';
 import { engine } from '../engine';
 import { isAudible, nextSegment, prevSegment, ui } from '../state';
 import { addDays, clamp, fmtClock, fmtDate, fmtDur, startOfDay, DAY } from '../util';
 
-const level = ref(0);
+const enhanceOn = ref(audio.enhanced());
+const enhance = computed({
+  get: () => enhanceOn.value,
+  set: (v: boolean) => {
+    audio.setEnhance(v);
+    enhanceOn.value = v;
+  },
+});
+
+// The clock and level meter change every frame during playback. They are
+// written straight to the DOM instead of through reactive state, so the rest
+// of the transport bar (checkboxes, buttons) is not re-rendered 60 times a
+// second, which made the checkboxes flicker in some browsers.
+const clockEl = ref<HTMLDivElement>();
+const dateEl = ref<HTMLDivElement>();
+const meterEl = ref<HTMLDivElement>();
+let level = 0;
+let shown = { clock: '', date: '', meter: '' };
 let raf = 0;
 const loop = () => {
   raf = requestAnimationFrame(loop);
-  level.value = Math.max(engine.level(), level.value * 0.9);
+  level = Math.max(engine.level(), level * 0.9);
+  const next = {
+    clock: fmtClock(ui.playhead, true),
+    date: fmtDate(ui.playhead),
+    meter: `${Math.min(100, Math.sqrt(level) * 100).toFixed(1)}%`,
+  };
+  if (next.clock !== shown.clock && clockEl.value) clockEl.value.textContent = next.clock;
+  if (next.date !== shown.date && dateEl.value) dateEl.value.textContent = next.date;
+  if (next.meter !== shown.meter && meterEl.value) meterEl.value.style.width = next.meter;
+  shown = next;
 };
 onMounted(() => (raf = requestAnimationFrame(loop)));
 onBeforeUnmount(() => cancelAnimationFrame(raf));
@@ -67,16 +94,17 @@ defineExpose({ jump, zoom, fitSelection, stop });
       <button @click="jump(1)" title="Next speech  ]">⏭</button>
     </div>
     <div class="time">
-      <div class="clock">{{ fmtClock(ui.playhead, true) }}</div>
-      <div class="date">{{ fmtDate(ui.playhead) }}</div>
+      <div class="clock" ref="clockEl" />
+      <div class="date" ref="dateEl" />
     </div>
     <div class="sel" v-if="ui.selection">
-      <div>{{ fmtClock(ui.selection.from, true) }} → {{ fmtClock(ui.selection.to, true) }}</div>
+      <div class="mono">{{ fmtClock(ui.selection.from, true) }} → {{ fmtClock(ui.selection.to, true) }}</div>
       <div class="dim">selection · {{ fmtDur(ui.selection.to - ui.selection.from) }}</div>
     </div>
     <div class="sel dim" v-else>drag on the timeline to select a range</div>
     <div class="toggles">
       <label title="Jump over stretches where nobody (audible) speaks"><input type="checkbox" v-model="ui.skipSilence" /> Skip silence</label>
+      <label title="Opus neural speech enhancement (NoLACE) on playback and export; clearer low-bitrate wideband speech"><input type="checkbox" v-model="enhance" /> Enhance speech</label>
       <label title="Keep the playhead in view"><input type="checkbox" v-model="ui.follow" /> Follow</label>
       <label title="Loop the selection (L)"><input type="checkbox" v-model="ui.loop" /> Loop</label>
     </div>
@@ -93,7 +121,7 @@ defineExpose({ jump, zoom, fitSelection, stop });
     </div>
     <div class="master">
       <input type="range" min="0" max="2" step="0.01" v-model.number="ui.mix.master" @input="engine.applyGains()" title="Master volume" />
-      <div class="meter"><div :style="{ width: `${Math.min(100, Math.sqrt(level) * 100)}%` }" /></div>
+      <div class="meter"><div ref="meterEl" /></div>
     </div>
     <button class="primary" @click="ui.exportOpen = true" title="Download a range (E)">Export…</button>
   </footer>
@@ -125,8 +153,12 @@ defineExpose({ jump, zoom, fitSelection, stop });
   color: white;
 }
 .time {
+  flex: none;
+  font-family: var(--mono);
   font-variant-numeric: tabular-nums;
-  min-width: 112px;
+  min-width: 140px;
+  /* repaints of the per-frame clock stay inside this box */
+  contain: layout paint;
 }
 .clock {
   font-size: 19px;
@@ -173,6 +205,7 @@ defineExpose({ jump, zoom, fitSelection, stop });
   width: 120px;
 }
 .meter {
+  contain: layout paint;
   height: 4px;
   background: #2a2c33;
   border-radius: 2px;

@@ -2,6 +2,7 @@
 // made here; rendering (decode, mix, encode) runs in a Web Worker.
 
 import { fileUrl, type Seg } from './api';
+import * as audio from './audio';
 import type { ExportItem, ExportJob, ExportMessage } from './export.worker';
 import {
   channelPath,
@@ -132,6 +133,7 @@ export function runExport(
     split: plan.split,
     labels: plan.outputs.map((x) => x.label),
     filename: plan.filename,
+    enhance: audio.enhanced(),
     items,
   };
   return new Promise((resolve, reject) => {

@@ -46,6 +46,8 @@ const OVERVIEW_H = 44;
 const MIN_MS_PER_PX = 0.05;
 const MAX_MS_PER_PX = (14 * DAY) / 800;
 
+/** Monospace font for timestamps drawn on canvases (CSS: var(--mono)). */
+const MONO = getComputedStyle(document.documentElement).getPropertyValue('--mono').trim() || 'monospace';
 const viewEnd = () => ui.view.start + ui.view.width * ui.view.msPerPx;
 const xOf = (t: number) => (t - ui.view.start) / ui.view.msPerPx;
 const tOf = (x: number) => ui.view.start + x * ui.view.msPerPx;
@@ -280,7 +282,7 @@ function drawRuler() {
   const minor = step / 5;
   ctx.fillStyle = 'rgba(255,255,255,.25)';
   for (let t = Math.ceil(from / minor) * minor; t < to; t += minor) ctx.fillRect(Math.round(xOf(t)), RULER_H - 9, 1, 4);
-  ctx.font = '11px system-ui, sans-serif';
+  ctx.font = `11px ${MONO}`;
   // align to local midnight for day-level steps
   const base = step >= HOUR ? startOfDay(from) : 0;
   for (let t = base + Math.ceil((from - base) / step) * step; t < to; t += step) {
@@ -349,7 +351,7 @@ function drawOverview() {
     }
   }
   // hour ticks + labels
-  ctx.font = '10px system-ui, sans-serif';
+  ctx.font = `10px ${MONO}`;
   const step = tickStep(ms, 70);
   const b0 = startOfDay(from);
   for (let t = b0 + Math.ceil((from - b0) / step) * step; t < to; t += step) {
@@ -571,7 +573,7 @@ watch(() => JSON.stringify(ui.mix) + ui.hiddenChannels.size + ui.hiddenSpeakers.
     <div class="body">
       <div class="headers" @wheel.prevent="(e) => scrollBy(e.deltaY)">
         <div class="ruler-spacer" title="Wheel over lanes: zoom or scroll (toggle W), Shift+wheel: the other · wheel over ruler: zoom · wheel over overview: scroll · Alt+wheel: scroll tracks · drag: select · Alt/middle-drag: pan">
-          <span>{{ fmtDate(ui.view.start) }}</span>
+          <span class="mono">{{ fmtDate(ui.view.start) }}</span>
           <span class="spacer" />
           <button class="link" @click="collapseAll(true)" title="Collapse every channel to one merged lane">collapse</button>
           <button class="link" @click="collapseAll(false)" title="Expand all channels">expand</button>

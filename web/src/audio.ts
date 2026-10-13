@@ -4,7 +4,21 @@
 // never blocks drawing or playback scheduling.
 
 import { fileUrl, type Seg } from './api';
-import { Decoder, fetchRangeUrl, fetchUrl, groupRanges, parse, RATE as CODEC_RATE } from './codec';
+import { Decoder, ENHANCED, fetchRangeUrl, fetchUrl, groupRanges, parse, PLAIN, RATE as CODEC_RATE } from './codec';
+
+/** Speech enhancement (NoLACE) on decode; see setEnhance. */
+let enhance = localStorage.getItem('mumble-archive.enhance') !== '0';
+
+export const enhanced = () => enhance;
+
+/** Switch speech enhancement; already decoded audio is dropped so it is decoded again. */
+export function setEnhance(on: boolean) {
+  if (on === enhance) return;
+  enhance = on;
+  localStorage.setItem('mumble-archive.enhance', on ? '1' : '0');
+  cache.clear();
+  cachedSamples = 0;
+}
 
 export const RATE = CODEC_RATE;
 
@@ -41,7 +55,7 @@ class DecodePool {
   decode(kind: Kind, bytes: Uint8Array): Promise<Float32Array> {
     if (!this.workers.length) {
       this.fallback ??= new Decoder();
-      return this.fallback.decode(parse(kind, bytes));
+      return this.fallback.decode(parse(kind, bytes), enhance ? ENHANCED : PLAIN);
     }
     let best = 0;
     this.workers.forEach((x, i) => {
@@ -53,7 +67,7 @@ class DecodePool {
     return new Promise((resolve, reject) => {
       this.jobs.set(id, { resolve, reject, worker: best });
       this.workers[best].pending++;
-      this.workers[best].w.postMessage({ id, kind, bytes: own }, [own.buffer]);
+      this.workers[best].w.postMessage({ id, kind, bytes: own, enhance }, [own.buffer]);
     });
   }
 }

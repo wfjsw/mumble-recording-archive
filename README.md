@@ -42,6 +42,11 @@ archive. Any static host that supports Range serves them together with the built
 - Speech is re-encoded with libopus VBR (default 12 kbit/s, 120 ms frames) and is
   **never encoded above the source bitrate**. Sources already at or below the
   target keep their original packets.
+- Below 12 kbit/s the encoder is held at wideband: libopus would otherwise drop to
+  narrowband (telephone quality) at e.g. 8 kbit/s for about the same size.
+- The web player decodes with Opus' neural speech enhancement (NoLACE, libopus 1.6),
+  which makes low-bitrate wideband speech clearer; it can be switched off ("Enhance
+  speech") and costs a ~2.7 MB (gzipped) WebAssembly download, cached once.
 - Segments are packed into one append-only file per day with a ~20-byte header per
   segment, so there is no per-file filesystem slack.
 - Typical result: ~7× smaller than the incoming Mumble stream, about 4–5 MB per hour
@@ -93,6 +98,14 @@ cross build --release --target aarch64-unknown-linux-musl
 ```
 
 glibc targets (`*-unknown-linux-gnu`) build too, but the binary then needs glibc ≥ 2.39.
+
+The browser's Opus decoder (`web/src/wasm/opus.{mjs,wasm}`, checked in) is libopus
+from the Rust `opusic-sys` crate built with speech enhancement; rebuild it with
+Emscripten after updating that crate:
+
+```sh
+docker run --rm -v "$PWD:/src" -v "<cargo registry>/opusic-sys-0.7.x/opus:/opus:ro"   -e OPUS_SRC=/opus -w /src emscripten/emsdk:latest sh web/wasm/build.sh
+```
 If you built with cross's default images before, run `cargo clean` once.
 
 ## Run

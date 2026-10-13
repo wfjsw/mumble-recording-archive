@@ -79,6 +79,13 @@ impl SpeechEncoder {
         enc.set_signal(Signal::Voice)?;
         // DTX: near-silent frames inside speech cost 1-2 bytes (~4% smaller on speech).
         enc.set_dtx(true)?;
+        // At low bitrates libopus drops to narrowband (telephone quality) on its own,
+        // e.g. 100% of packets at 8 kb/s. Wideband costs about the same there and
+        // is what Opus' decoder-side speech enhancement works on. (It cannot be
+        // forced below ~8 kb/s; libopus then still picks narrow/medium band.)
+        if bitrate_bps < 12_000 {
+            enc.set_bandwidth(opus::Bandwidth::Wideband)?;
+        }
         let pre_skip = enc.get_lookahead()?.max(0) as usize;
         Ok(Self { enc, pre_skip, out: vec![0u8; 4000] })
     }
@@ -197,6 +204,18 @@ mod tests {
         assert!(energy > 0.01, "energy {energy}");
         let quiet = &out[60_000..130_000];
         assert!(quiet.iter().all(|v| v.abs() < 0.05));
+    }
+
+    #[test]
+    fn low_bitrate_stays_wideband() {
+        // speech-like signal: harmonics up to ~6 kHz
+        let pcm: Vec<f32> = (0..48_000 * 3)
+            .map(|i| (1..30).map(|h| (i as f32 * 200.0 * h as f32 * std::f32::consts::TAU / 48_000.0).sin() * 0.3 / h as f32).sum())
+            .collect();
+        let mut enc = SpeechEncoder::new(8_000).unwrap();
+        let (_, packets) = enc.encode(&pcm).unwrap();
+        // TOC configs 8..=11 = SILK wideband
+        assert!(packets.iter().filter(|p| p.len() > 2).all(|p| (8..=11).contains(&(p[0] >> 3))), "not wideband");
     }
 
     #[test]

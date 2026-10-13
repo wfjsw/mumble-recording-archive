@@ -10,7 +10,6 @@
     "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
-    "opus-decoder": "^0.7.12",
     "vue": "^3.5.43"
   },
   "devDependencies": {

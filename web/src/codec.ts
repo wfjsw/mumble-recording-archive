@@ -2,7 +2,7 @@
 // pack record / Ogg parsing, Opus decoding, and grouping of byte ranges into
 // few HTTP Range requests. No DOM or app state in here.
 
-import { OpusDecoder } from 'opus-decoder';
+import createOpus, { type OpusModule } from './wasm/opus.mjs';
 
 export const RATE = 48000;
 
@@ -73,17 +73,62 @@ export function parseOgg(data: Uint8Array): Parsed {
   return { preSkip, samples: Math.max(0, granule - preSkip), packets: packets.slice(2) };
 }
 
-/** A mono Opus decoder for independent streams (state is reset per stream). */
-export class Decoder {
-  private dec = new OpusDecoder({ channels: 1, preSkip: 0 });
-  readonly ready: Promise<void> = this.dec.ready;
+let opusModule: Promise<OpusModule> | null = null;
 
-  async decode(p: Parsed): Promise<Float32Array> {
+/** libopus (WebAssembly, web/wasm/build.sh), loaded once per thread. */
+const loadOpus = () => (opusModule ??= createOpus());
+
+/**
+ * Decoder complexity: 7 turns on NoLACE, Opus' neural speech enhancement for
+ * wideband SILK (our low-bitrate archive); 0 is the plain decoder.
+ */
+export const ENHANCED = 7;
+export const PLAIN = 0;
+
+const MAX_FRAME = 5760; // 120 ms @ 48 kHz
+const MAX_PACKET = 1500;
+
+/** A mono 48 kHz Opus decoder for independent streams (state is reset per stream). */
+export class Decoder {
+  private m: OpusModule | null = null;
+  private dec = 0;
+  private inp = 0;
+  private out = 0;
+  private complexity = -1;
+  readonly ready: Promise<void>;
+
+  constructor() {
+    this.ready = loadOpus().then((m) => {
+      this.m = m;
+      this.dec = m._dec_create(ENHANCED);
+      this.complexity = ENHANCED;
+      this.inp = m._malloc(MAX_PACKET);
+      this.out = m._malloc(MAX_FRAME * 4);
+      if (!this.dec) throw new Error('cannot create Opus decoder');
+    });
+  }
+
+  async decode(p: Parsed, complexity = ENHANCED): Promise<Float32Array> {
     await this.ready;
-    await this.dec.reset();
-    const out = this.dec.decodeFrames(p.packets);
-    const pcm = out.channelData[0] ?? new Float32Array(0);
-    const end = p.samples > 0 ? Math.min(pcm.length, p.preSkip + p.samples) : pcm.length;
+    const m = this.m!;
+    if (complexity !== this.complexity) {
+      m._dec_set_complexity(this.dec, complexity);
+      this.complexity = complexity;
+    }
+    m._dec_reset(this.dec);
+    const total = p.packets.length * MAX_FRAME;
+    const pcm = new Float32Array(Math.max(total, 0));
+    let n = 0;
+    for (const pkt of p.packets) {
+      if (!pkt.length || pkt.length > MAX_PACKET) continue;
+      m.HEAPU8.set(pkt, this.inp);
+      const got = m._dec_decode(this.dec, this.inp, pkt.length, this.out);
+      if (got <= 0) continue; // corrupt packet: skip (rare; shortens the clip slightly)
+      // HEAPF32 may be replaced when memory grows: read it after the call.
+      pcm.set(m.HEAPF32.subarray(this.out >> 2, (this.out >> 2) + got), n);
+      n += got;
+    }
+    const end = p.samples > 0 ? Math.min(n, p.preSkip + p.samples) : n;
     return pcm.slice(Math.min(p.preSkip, end), end);
   }
 }

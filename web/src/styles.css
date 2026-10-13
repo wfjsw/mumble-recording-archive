@@ -1,4 +1,6 @@
+/* Timestamps use a monospace font so digits don't shift as they change. */
 :root {
+  --mono: ui-monospace, 'SF Mono', 'Cascadia Mono', 'Segoe UI Mono', Menlo, Consolas, 'Liberation Mono', monospace;
   --bg: #16171b;
   --panel: #1d1f24;
   --line: #2c2e35;
@@ -20,6 +22,10 @@ body,
   color: var(--text);
   font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   overflow: hidden;
+}
+
+.mono {
+  font-family: var(--mono);
 }
 
 button {
