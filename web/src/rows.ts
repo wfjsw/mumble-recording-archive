@@ -1,9 +1,9 @@
 import { computed } from 'vue';
 import {
   tree,
+  activeTracks,
   dataVersion,
   isVisible,
-  segmentsIn,
   speakerName,
   trackKey,
   ui,
@@ -48,10 +48,9 @@ export const scope = computed(() => {
 export const rows = computed<Row[]>(() => {
   void dataVersion.value;
   const { from, to } = scope.value;
-  const byChannel = new Map<number, Set<number>>();
-  for (const s of segmentsIn(from, to)) {
-    (byChannel.get(s.channelId) ?? byChannel.set(s.channelId, new Set()).get(s.channelId)!).add(s.speakerId);
-  }
+  // Read from the coarse bitmaps: the scope is whole days, so "spoke at all"
+  // is exactly what the lanes need, and a month of clips never gets scanned.
+  const byChannel = activeTracks(from, to);
   const out: Row[] = [];
   let y = 0;
   // Active channels in tree order; channels unknown to the tree go last.

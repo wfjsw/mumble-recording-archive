@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, toRaw, watch } from 'vue';
 import type { Seg } from '../api';
 import * as audio from '../audio';
 import { engine } from '../engine';
@@ -11,10 +11,21 @@ import {
   dataVersion,
   dayList,
   ensureRange,
+  loadingVersion,
+  mixVersion,
+  anyBit,
+  bitDaysIn,
+  pendingIn,
   presenceIn,
   segmentsIn,
+  setTrack,
+  weightIn,
+  type BitDay,
   speakerName,
+  toggleChannel,
+  toggleTrack,
   trackGain,
+  trackKey,
   trackStrip,
   ui,
   uptimeIn,
@@ -29,6 +40,7 @@ import {
   fmtDur,
   fmtTick,
   speakerColor,
+  speakerHue,
   startOfDay,
   addDays,
   timeZone,
@@ -38,6 +50,10 @@ import {
 const overview = ref<HTMLCanvasElement>();
 const ruler = ref<HTMLCanvasElement>();
 const lanes = ref<HTMLCanvasElement>();
+// Transparent canvases on top of each layer, for the selection and playhead.
+const overviewTop = ref<HTMLCanvasElement>();
+const rulerTop = ref<HTMLCanvasElement>();
+const lanesTop = ref<HTMLCanvasElement>();
 const lanesBox = ref<HTMLDivElement>();
 const tooltip = ref<{ x: number; y: number; lines: string[] } | null>(null);
 const lanesHeight = ref(400);
@@ -45,6 +61,11 @@ const lanesHeight = ref(400);
 const OVERVIEW_H = 44;
 const MIN_MS_PER_PX = 0.05;
 const MAX_MS_PER_PX = (14 * DAY) / 800;
+/**
+ * From this zoom out, a pixel covers two minutes: draw from the coarse
+ * per-day bitmaps instead of walking the clips (a month is millions of them).
+ */
+const COARSE_MS_PER_PX = 120_000;
 
 /** Monospace font for timestamps drawn on canvases (CSS: var(--mono)). */
 const MONO = getComputedStyle(document.documentElement).getPropertyValue('--mono').trim() || 'monospace';
@@ -62,27 +83,37 @@ watch(
 );
 
 // ---------- drawing ----------
+//
+// Each area is two canvases: a static layer (grid, rows, clips, overview
+// density) and a transparent one on top holding only the selection and
+// playhead. Moving the playhead then costs two rectangles instead of a redraw
+// of the timeline, however much speech the view holds.
 
-let dirty = true;
+let staticDirty = true;
+let overlayDirty = true;
 let raf = 0;
-const invalidate = () => (dirty = true);
+const invalidate = () => (staticDirty = true);
+
+/** Repaint the static layers when the view, the data, the mixer or a filter changes. */
 watch(
   () => [
     ui.view.start,
     ui.view.msPerPx,
     ui.view.width,
     ui.scrollY,
-    ui.selection,
-    ui.playhead,
     dataVersion.value,
     rows.value,
-    JSON.stringify(ui.mix),
+    mixVersion.value,
+    loadingVersion.value,
     ui.hiddenChannels.size,
     ui.hiddenSpeakers.size,
     timeZone.value,
   ],
   invalidate,
 );
+
+/** Playhead and selection live on the overlay: they never invalidate the static layers. */
+watch([() => ui.playhead, () => ui.selection], () => (overlayDirty = true));
 
 function setupCanvas(c: HTMLCanvasElement, w: number, h: number): CanvasRenderingContext2D {
   const dpr = window.devicePixelRatio || 1;
@@ -97,6 +128,23 @@ function setupCanvas(c: HTMLCanvasElement, w: number, h: number): CanvasRenderin
   return ctx;
 }
 
+/** Clear a layer (in CSS pixels) and hand back its context. */
+function clearLayer(c: HTMLCanvasElement, w: number, h: number): CanvasRenderingContext2D {
+  const ctx = setupCanvas(c, w, h);
+  ctx.clearRect(0, 0, w, h);
+  return ctx;
+}
+
+function paintOverlays() {
+  const ov = overviewTop.value;
+  const ru = rulerTop.value;
+  const la = lanesTop.value;
+  if (!ov || !ru || !la || !overviewWidth) return;
+  drawOverviewOverlay(clearLayer(ov, overviewWidth, OVERVIEW_H));
+  drawRulerOverlay(clearLayer(ru, ui.view.width, RULER_H));
+  drawLanesOverlay(clearLayer(la, ui.view.width, lanesHeight.value));
+}
+
 function frame() {
   raf = requestAnimationFrame(frame);
   if (ui.playing) {
@@ -106,16 +154,22 @@ function frame() {
       const W = ui.view.width;
       if (x > W * 0.92 || x < 0) ui.view.start = ui.playhead - W * ui.view.msPerPx * 0.08;
     }
-    dirty = true;
+    overlayDirty = true;
   }
-  if (!dirty) return;
-  dirty = false;
-  drawOverview();
-  drawRuler();
-  drawLanes();
+  if (staticDirty) {
+    staticDirty = false;
+    drawOverview();
+    drawRuler();
+    drawLanes();
+    overlayDirty = true;
+  }
+  if (overlayDirty) {
+    overlayDirty = false;
+    paintOverlays();
+  }
 }
 
-function peakAt(s: Seg, t0: number, t1: number, pcm: Float32Array | undefined): number {
+function peakAt(s: Seg, t0: number, t1: number, pcm: Float32Array | undefined, pps: number): number {
   if (pcm) {
     const a = clamp(Math.floor((t0 - s.startMs) * 48), 0, pcm.length);
     const b = clamp(Math.ceil((t1 - s.startMs) * 48), a + 1, pcm.length);
@@ -128,7 +182,6 @@ function peakAt(s: Seg, t0: number, t1: number, pcm: Float32Array | undefined): 
   }
   const p = s.peaks;
   if (!p || !p.length) return 0.5;
-  const pps = catalog.value?.peaksPerSec ?? 10;
   const a = clamp(Math.floor(((t0 - s.startMs) / 1000) * pps), 0, p.length - 1);
   const b = clamp(Math.ceil(((t1 - s.startMs) / 1000) * pps), a + 1, p.length);
   let m = 0;
@@ -136,12 +189,29 @@ function peakAt(s: Seg, t0: number, t1: number, pcm: Float32Array | undefined): 
   return m / 255;
 }
 
-function drawClip(ctx: CanvasRenderingContext2D, s: Seg, top: number, h: number, label: string | null, W: number) {
+/**
+ * Color factory for one row of clips. Built once per row instead of once per
+ * clip: at day zoom that is hundreds of thousands of closures and strings.
+ */
+function clipColor(speakerId: number, audible: boolean): (a: number) => string {
+  if (!audible) return (a) => `rgba(140,140,150,${a})`;
+  const h = speakerHue(speakerId);
+  return (a) => `hsla(${h}, 70%, 62%, ${a})`;
+}
+
+function drawClip(
+  ctx: CanvasRenderingContext2D,
+  s: Seg,
+  top: number,
+  h: number,
+  label: string | null,
+  W: number,
+  col: (a: number) => string,
+  pps: number,
+) {
   const x0 = xOf(s.startMs);
   const x1 = xOf(s.endMs);
   if (x1 < 0 || x0 > W) return;
-  const audible = trackGain(s.channelId, s.speakerId) > 0;
-  const col = (a: number) => (audible ? speakerColor(s.speakerId, a) : `rgba(140,140,150,${a})`);
   const w = Math.max(1, x1 - x0);
   ctx.fillStyle = col(0.18);
   ctx.fillRect(x0, top + 2, w, h - 4);
@@ -153,7 +223,7 @@ function drawClip(ctx: CanvasRenderingContext2D, s: Seg, top: number, h: number,
     const from = Math.max(0, Math.floor(x0));
     const to = Math.min(W, Math.ceil(x1));
     for (let px = from; px < to; px++) {
-      const d = peakAt(s, tOf(px), tOf(px + 1), pcm) * amp;
+      const d = peakAt(s, tOf(px), tOf(px + 1), pcm, pps) * amp;
       ctx.fillRect(px, mid - d, 1, Math.max(1, 2 * d));
     }
   }
@@ -175,6 +245,100 @@ function drawClip(ctx: CanvasRenderingContext2D, s: Seg, top: number, h: number,
   }
 }
 
+/**
+ * Paint contiguous set pixels of `mask` as one run each. Runs go into a single
+ * path per layer (thousands of fillRect calls at a month's zoom are slow), and
+ * a one-pixel gap is bridged: at that zoom it is not visible.
+ */
+function paintRuns(ctx: CanvasRenderingContext2D, mask: Uint8Array, fill: string, line: string | null, y: number, h: number, W: number) {
+  const body = new Path2D();
+  const head = new Path2D();
+  let x = 0;
+  let any = false;
+  while (x < W) {
+    if (!mask[x]) {
+      x++;
+      continue;
+    }
+    let e = x + 1;
+    for (;;) {
+      while (e < W && mask[e]) e++;
+      if (e + 1 < W && mask[e + 1]) {
+        e += 2;
+        continue;
+      }
+      break;
+    }
+    body.rect(x, y, e - x, h);
+    if (line) head.rect(x, y, e - x, 1.5);
+    any = true;
+    x = e;
+  }
+  if (!any) return;
+  ctx.fillStyle = fill;
+  ctx.fill(body);
+  if (line) {
+    ctx.fillStyle = line;
+    ctx.fill(head);
+  }
+}
+
+/**
+ * Level of detail for a row whose clips are narrower than a few pixels: mark
+ * covered pixels in one pass, then fill contiguous runs. A day of speech in
+ * view is ~10^5 clips but only `W` runs, so the number of fillRect calls no
+ * longer scales with the data.
+ */
+function drawDense(
+  ctx: CanvasRenderingContext2D,
+  list: Seg[],
+  fill: string,
+  line: string,
+  top: number,
+  h: number,
+  W: number,
+  mask: Uint8Array,
+) {
+  mask.fill(0);
+  for (const s of list) {
+    const a = Math.max(0, Math.floor(xOf(s.startMs)));
+    const b = Math.min(W, Math.ceil(xOf(s.endMs)));
+    if (b > a) mask.fill(1, a, b);
+    else if (a < W) mask[a] = 1;
+  }
+  paintRuns(ctx, mask, fill, line, top + 2, h - 4, W);
+}
+
+/** Pixels per coarse bitmap day, so each column reads the right day's bits. */
+function dayColumns(bits: BitDay[], W: number, from: number, mpp: number): Int16Array {
+  const dayOf = new Int16Array(W).fill(-1);
+  for (let i = 0; i < bits.length; i++) {
+    const a = Math.max(0, Math.floor((bits[i].from - from) / mpp));
+    const b = Math.min(W, Math.ceil((bits[i].to - from) / mpp));
+    for (let x = a; x < b; x++) dayOf[x] = i;
+  }
+  return dayOf;
+}
+
+/** Mark the columns whose time range has any bit set in `get(day)`. */
+function maskFromBits(
+  mask: Uint8Array,
+  bits: BitDay[],
+  dayOf: Int16Array,
+  get: (d: BitDay) => Uint8Array | undefined,
+  W: number,
+  from: number,
+  mpp: number,
+) {
+  mask.fill(0);
+  for (let x = 0; x < W; x++) {
+    const i = dayOf[x];
+    if (i < 0) continue;
+    const d = bits[i];
+    if (anyBit(get(d), d, from + x * mpp, from + (x + 1) * mpp)) mask[x] = 1;
+  }
+}
+
 function drawLanes() {
   const c = lanes.value;
   const box = lanesBox.value;
@@ -192,20 +356,34 @@ function drawLanes() {
   ctx.fillStyle = 'rgba(255,255,255,.045)';
   for (let t = Math.ceil(from / step) * step; t < to; t += step) ctx.fillRect(Math.round(xOf(t)), 0, 1, H);
 
-  const segs = segmentsIn(from, to);
+  const mpp = ui.view.msPerPx;
+  const coarse = mpp >= COARSE_MS_PER_PX;
+  const segs = coarse ? [] : segmentsIn(from, to);
+  const pps = catalog.value?.peaksPerSec ?? 10;
+  // Clips far narrower than a pixel are aggregated per row instead.
+  const dense = segs.length > W * 4;
+
   const byTrack = new Map<string, Seg[]>();
   const byChannel = new Map<number, Seg[]>();
-  for (const s of segs) {
-    const k = `${s.channelId}:${s.speakerId}`;
-    (byTrack.get(k) ?? byTrack.set(k, []).get(k)!).push(s);
-    (byChannel.get(s.channelId) ?? byChannel.set(s.channelId, []).get(s.channelId)!).push(s);
-  }
   const presence = new Map<string, [number, number][]>();
-  for (const p of presenceIn(from, to)) {
-    const k = `${p.channelId}:${p.speakerId}`;
-    (presence.get(k) ?? presence.set(k, []).get(k)!).push([p.startMs, p.endMs ?? Date.now()]);
+  let bits: BitDay[] = [];
+  let dayOf: Int16Array = new Int16Array(0);
+  if (coarse) {
+    bits = bitDaysIn(from, to);
+    dayOf = dayColumns(bits, W, from, mpp);
+  } else {
+    for (const s of segs) {
+      const k = trackKey(s.channelId, s.speakerId);
+      (byTrack.get(k) ?? byTrack.set(k, []).get(k)!).push(s);
+      (byChannel.get(s.channelId) ?? byChannel.set(s.channelId, []).get(s.channelId)!).push(s);
+    }
+    for (const p of presenceIn(from, to)) {
+      const k = trackKey(p.channelId, p.speakerId);
+      (presence.get(k) ?? presence.set(k, []).get(k)!).push([p.startMs, p.endMs ?? Date.now()]);
+    }
   }
 
+  const mask = new Uint8Array(W);
   for (const r of rows.value) {
     const top = r.y - ui.scrollY;
     if (top > H || top + r.h < 0) continue;
@@ -215,8 +393,26 @@ function drawLanes() {
       ctx.fillStyle = channelColor(r.channelId, 0.8);
       ctx.fillRect(0, top + r.h - 1, W, 1);
       if (r.h === COLLAPSED_H) {
+        if (coarse) {
+          // merged lane: the channel's own bitmap, in the channel colour
+          maskFromBits(mask, bits, dayOf, (d) => d.byChannel.get(r.channelId), W, from, mpp);
+          paintRuns(ctx, mask, channelColor(r.channelId, 0.35), channelColor(r.channelId, 0.9), top + 6, r.h - 12, W);
+          continue;
+        }
+        // group once: a per-clip scan over every speaker would be quadratic
+        const bySp = new Map<number, Seg[]>();
         for (const s of byChannel.get(r.channelId) ?? []) {
-          if (r.speakers.includes(s.speakerId)) drawClip(ctx, s, top + 4, r.h - 8, speakerName(s.speakerId), W);
+          (bySp.get(s.speakerId) ?? bySp.set(s.speakerId, []).get(s.speakerId)!).push(s);
+        }
+        for (const sp of r.speakers) {
+          const list = bySp.get(sp) ?? [];
+          const col = clipColor(sp, trackGain(r.channelId, sp) > 0);
+          if (dense && list.length > W) {
+            drawDense(ctx, list, col(0.18), col(1), top + 4, r.h - 8, W, mask);
+          } else {
+            const label = speakerName(sp);
+            for (const s of list) drawClip(ctx, s, top + 4, r.h - 8, label, W, col, pps);
+          }
         }
       }
       continue;
@@ -224,27 +420,59 @@ function drawLanes() {
     ctx.fillStyle = (r.y / 58) % 2 ? '#1a1b20' : '#1c1d22';
     ctx.fillRect(0, top, W, r.h);
     // presence: speaker was in this channel
-    ctx.fillStyle = 'rgba(120,160,255,.06)';
-    for (const [a, b] of presence.get(r.key) ?? []) {
-      const x0 = Math.max(0, xOf(a));
-      const x1 = Math.min(W, xOf(b));
-      if (x1 > x0) ctx.fillRect(x0, top, x1 - x0, r.h);
+    if (coarse) {
+      maskFromBits(mask, bits, dayOf, (d) => d.presence.get(r.key), W, from, mpp);
+      paintRuns(ctx, mask, 'rgba(120,160,255,.06)', null, top, r.h, W);
+    } else {
+      ctx.fillStyle = 'rgba(120,160,255,.06)';
+      for (const [a, b] of presence.get(r.key) ?? []) {
+        const x0 = Math.max(0, xOf(a));
+        const x1 = Math.min(W, xOf(b));
+        if (x1 > x0) ctx.fillRect(x0, top, x1 - x0, r.h);
+      }
     }
-    for (const s of byTrack.get(r.key) ?? []) drawClip(ctx, s, top + 3, r.h - 6, null, W);
+    // one mixer lookup per row, outside the clip loop
+    const col = clipColor(r.speakerId!, trackGain(r.channelId, r.speakerId!) > 0);
+    if (coarse) {
+      maskFromBits(mask, bits, dayOf, (d) => d.speech.get(r.key), W, from, mpp);
+      paintRuns(ctx, mask, col(0.18), col(1), top + 5, r.h - 10, W);
+    } else {
+      const list = byTrack.get(r.key) ?? [];
+      if (dense && list.length > W) drawDense(ctx, list, col(0.18), col(1), top + 3, r.h - 6, W, mask);
+      else for (const s of list) drawClip(ctx, s, top + 3, r.h - 6, null, W, col, pps);
+    }
     ctx.fillStyle = 'rgba(0,0,0,.35)';
     ctx.fillRect(0, top + r.h - 1, W, 1);
   }
 
-  drawSelectionAndPlayhead(ctx, H);
+  // Days the catalog says hold speech but whose log has not arrived yet: show
+  // that up front instead of leaving the range looking empty.
+  const pending = pendingIn(from, to);
+  if (pending.length) {
+    ctx.fillStyle = 'rgba(122,162,255,.055)';
+    for (const d of pending) {
+      const x0 = Math.max(0, xOf(d.from));
+      const x1 = Math.min(W, xOf(d.to));
+      if (x1 > x0) ctx.fillRect(x0, 0, x1 - x0, H);
+    }
+    ctx.fillStyle = 'rgba(180,198,235,.8)';
+    ctx.font = '12px system-ui, sans-serif';
+    for (const d of pending) {
+      const x0 = Math.max(0, xOf(d.from));
+      const x1 = Math.min(W, xOf(d.to));
+      if (x1 - x0 > 96) ctx.fillText(`loading ${d.day}…`, x0 + 8, H - 12);
+    }
+  }
 
   // request exact waveforms when zoomed in far enough
-  if (ui.view.msPerPx < 40) {
+  if (mpp < 40) {
     const vis = segs.filter((s) => !audio.cached(s.id)).slice(0, 40);
-    if (vis.length) Promise.all(vis.map((s) => audio.load(s))).then(invalidate);
+    if (vis.length) void Promise.all(vis.map((s) => audio.load(s))).then(invalidate);
   }
 }
 
-function drawSelectionAndPlayhead(ctx: CanvasRenderingContext2D, H: number) {
+function drawLanesOverlay(ctx: CanvasRenderingContext2D) {
+  const H = lanesHeight.value;
   const sel = ui.selection;
   if (sel) {
     const x0 = xOf(sel.from);
@@ -292,6 +520,9 @@ function drawRuler() {
     ctx.fillStyle = '#c9cbd3';
     ctx.fillText(fmtTick(t, step), x + 4, 15);
   }
+}
+
+function drawRulerOverlay(ctx: CanvasRenderingContext2D) {
   const sel = ui.selection;
   if (sel) {
     ctx.fillStyle = 'rgba(110,150,255,.35)';
@@ -309,17 +540,36 @@ function drawRuler() {
 
 const overviewRange = computed(() => {
   const span = ui.view.width * ui.view.msPerPx;
-  if (span > 12 * HOUR) return { from: ui.view.start - span, to: ui.view.start + 2 * span };
   const mid = ui.view.start + span / 2;
+  // A margin around wide views, but never more than three days: the overview
+  // also loads and scans whatever it covers, so it must stay bounded.
+  if (span > 12 * HOUR) {
+    const w = Math.max(span, Math.min(span * 1.5, 3 * DAY));
+    return { from: mid - w / 2, to: mid + w / 2 };
+  }
   const d = startOfDay(mid);
   return { from: d, to: addDays(d, 1) };
 });
 watch([overviewRange, dayList], ([r]) => void ensureRange(r.from, r.to), { immediate: true });
 
+/**
+ * Inverse of the busiest column (98th percentile, so one outlier cannot flatten
+ * everything): the overview always uses its full height, whether the archive
+ * holds an hour of speech or a month of it.
+ */
+function overviewScale(totals: Float32Array): number {
+  const sorted = Float32Array.from(totals).sort();
+  const p = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.98))];
+  return p > 0 ? 1 / p : 0;
+}
+
+/** Width the overview was last laid out at (its canvas spans the whole editor). */
+let overviewWidth = 0;
+
 function drawOverview() {
   const c = overview.value;
   if (!c) return;
-  const W = c.parentElement!.clientWidth;
+  const W = (overviewWidth = c.parentElement!.clientWidth);
   const ctx = setupCanvas(c, W, OVERVIEW_H);
   ctx.fillStyle = '#121317';
   ctx.fillRect(0, 0, W, OVERVIEW_H);
@@ -328,26 +578,49 @@ function drawOverview() {
   const ox = (t: number) => (t - from) / ms;
   const n = Math.max(1, Math.floor(W / 2));
   const bucket = (to - from) / n;
-  const stacks = new Map<number, Float32Array>();
-  for (const s of segmentsIn(from, to)) {
-    if (ui.hiddenChannels.has(s.channelId) || ui.hiddenSpeakers.has(s.speakerId)) continue;
-    const arr = stacks.get(s.channelId) ?? stacks.set(s.channelId, new Float32Array(n)).get(s.channelId)!;
-    const a = Math.max(s.startMs, from);
-    const b = Math.min(s.endMs, to);
-    for (let i = Math.floor((a - from) / bucket); i <= Math.min(n - 1, Math.floor((b - from) / bucket)); i++) {
-      const bs = from + i * bucket;
-      arr[i] += Math.max(0, Math.min(b, bs + bucket) - Math.max(a, bs));
-    }
-  }
   const h = OVERVIEW_H - 14;
-  const base = new Float32Array(n);
-  for (const [ch, arr] of stacks) {
-    ctx.fillStyle = channelColor(ch, 0.85);
+  // Height says how much voice this column holds, scaled so the busiest column
+  // fills the strip: a month of dense speech keeps its contrast instead of
+  // saturating into one solid slab.
+  const density = new Float32Array(n);
+  for (const d of bitDaysIn(from, to)) {
+    for (let i = 0; i < n; i++) density[i] += weightIn(d, from + i * bucket, from + (i + 1) * bucket);
+  }
+  const scale = overviewScale(density) * h;
+  if (ui.view.msPerPx >= COARSE_MS_PER_PX) {
+    ctx.fillStyle = 'rgba(122,162,255,.85)';
     for (let i = 0; i < n; i++) {
-      if (!arr[i]) continue;
-      const v = Math.min(1, Math.sqrt(arr[i] / bucket)) * h;
-      ctx.fillRect(i * 2, OVERVIEW_H - 2 - base[i] - v, 2, v);
-      base[i] = Math.min(h, base[i] + v);
+      const v = Math.min(h, density[i] * scale);
+      if (v > 0.5) ctx.fillRect(i * 2, OVERVIEW_H - 2 - v, 2, v);
+    }
+  } else {
+    // Zoomed in: share each column's height between channels by speech time,
+    // so the colour still says who was talking where.
+    const stacks = new Map<number, Float32Array>();
+    // raw sets: do not pay for a reactive read per segment
+    const hiddenCh = toRaw(ui.hiddenChannels);
+    const hiddenSp = toRaw(ui.hiddenSpeakers);
+    for (const s of segmentsIn(from, to)) {
+      if (hiddenCh.has(s.channelId) || hiddenSp.has(s.speakerId)) continue;
+      const arr = stacks.get(s.channelId) ?? stacks.set(s.channelId, new Float32Array(n)).get(s.channelId)!;
+      const a = Math.max(s.startMs, from);
+      const b = Math.min(s.endMs, to);
+      for (let i = Math.floor((a - from) / bucket); i <= Math.min(n - 1, Math.floor((b - from) / bucket)); i++) {
+        const bs = from + i * bucket;
+        arr[i] += Math.max(0, Math.min(b, bs + bucket) - Math.max(a, bs));
+      }
+    }
+    const totals = new Float32Array(n);
+    for (const arr of stacks.values()) for (let i = 0; i < n; i++) totals[i] += arr[i];
+    const base = new Float32Array(n);
+    for (const [ch, arr] of stacks) {
+      ctx.fillStyle = channelColor(ch, 0.85);
+      for (let i = 0; i < n; i++) {
+        if (!arr[i] || !totals[i] || base[i] >= h) continue;
+        const v = Math.min((arr[i] / totals[i]) * Math.min(h, density[i] * scale), h - base[i]);
+        ctx.fillRect(i * 2, OVERVIEW_H - 2 - base[i] - v, 2, v);
+        base[i] += v;
+      }
     }
   }
   // hour ticks + labels
@@ -360,7 +633,14 @@ function drawOverview() {
     ctx.fillStyle = 'rgba(255,255,255,.45)';
     ctx.fillText(fmtTick(t, step), ox(t) + 3, 10);
   }
-  // viewport
+}
+
+function drawOverviewOverlay(ctx: CanvasRenderingContext2D) {
+  const W = overviewWidth;
+  if (!W) return;
+  const { from, to } = overviewRange.value;
+  const ms = (to - from) / W;
+  const ox = (t: number) => (t - from) / ms;
   const vx0 = ox(ui.view.start);
   const vx1 = ox(viewEnd());
   ctx.fillStyle = 'rgba(255,255,255,.08)';
@@ -531,6 +811,8 @@ onBeforeUnmount(() => {
 });
 
 const visibleRows = computed(() => rows.value.filter((r) => r.y + r.h > ui.scrollY && r.y < ui.scrollY + lanesHeight.value));
+/** Known days in the scope whose logs are still on their way. */
+const pending = computed(() => pendingIn(scope.value.from, scope.value.to));
 function trackCount(r: Row) {
   return r.speakers.length;
 }
@@ -553,22 +835,33 @@ function collapseAll(collapse: boolean) {
   ui.scrollY = 0;
 }
 
-function onGain() {
+function onTrackGain(key: string, e: Event) {
+  setTrack(key, { gain: Number((e.target as HTMLInputElement).value) });
   engine.applyGains();
 }
-watch(() => JSON.stringify(ui.mix) + ui.hiddenChannels.size + ui.hiddenSpeakers.size, () => engine.applyGains());
+
+function resetTrackGain(key: string) {
+  setTrack(key, { gain: 1 });
+  engine.applyGains();
+}
+
+// Mixer and filter changes reach the audio graph; drawing follows mixVersion.
+watch([mixVersion, () => ui.hiddenChannels.size, () => ui.hiddenSpeakers.size], () => engine.applyGains());
 </script>
 
 <template>
   <div class="editor">
     <div class="overview">
-      <canvas
-        ref="overview"
-        @pointerdown="overviewPointer"
-        @pointermove="overviewPointer"
-        @wheel.prevent="onOverviewWheel"
-        title="Overview — click or drag to navigate, wheel to scroll"
-      />
+      <div class="stack">
+        <canvas
+          ref="overview"
+          @pointerdown="overviewPointer"
+          @pointermove="overviewPointer"
+          @wheel.prevent="onOverviewWheel"
+          title="Overview — click or drag to navigate, wheel to scroll"
+        />
+        <canvas ref="overviewTop" class="over" />
+      </div>
     </div>
     <div class="body">
       <div class="headers" @wheel.prevent="(e) => scrollBy(e.deltaY)">
@@ -598,13 +891,13 @@ watch(() => JSON.stringify(ui.mix) + ui.hiddenChannels.size + ui.hiddenSpeakers.
               <button
                 class="ms"
                 :class="{ on: channelStrip(r.channelId).mute }"
-                @click="channelStrip(r.channelId).mute = !channelStrip(r.channelId).mute"
+                @click="toggleChannel(r.channelId, 'mute')"
                 title="Mute channel"
               >M</button>
               <button
                 class="ms solo"
                 :class="{ on: channelStrip(r.channelId).solo }"
-                @click="channelStrip(r.channelId).solo = !channelStrip(r.channelId).solo"
+                @click="toggleChannel(r.channelId, 'solo')"
                 title="Solo channel — listen to this channel's reconstructed stream"
               >S</button>
             </template>
@@ -613,8 +906,8 @@ watch(() => JSON.stringify(ui.mix) + ui.hiddenChannels.size + ui.hiddenSpeakers.
               <div class="track-main">
                 <div class="track-top">
                   <span class="name">{{ speakerName(r.speakerId!) }}</span>
-                  <button class="ms" :class="{ on: trackStrip(r.key).mute }" @click="trackStrip(r.key).mute = !trackStrip(r.key).mute" title="Mute">M</button>
-                  <button class="ms solo" :class="{ on: trackStrip(r.key).solo }" @click="trackStrip(r.key).solo = !trackStrip(r.key).solo" title="Solo">S</button>
+                  <button class="ms" :class="{ on: trackStrip(r.key).mute }" @click="toggleTrack(r.key, 'mute')" title="Mute">M</button>
+                  <button class="ms solo" :class="{ on: trackStrip(r.key).solo }" @click="toggleTrack(r.key, 'solo')" title="Solo">S</button>
                 </div>
                 <input
                   class="vol"
@@ -622,39 +915,45 @@ watch(() => JSON.stringify(ui.mix) + ui.hiddenChannels.size + ui.hiddenSpeakers.
                   min="0"
                   max="2"
                   step="0.01"
-                  v-model.number="trackStrip(r.key).gain"
-                  @input="onGain"
-                  @dblclick="trackStrip(r.key).gain = 1"
+                  :value="trackStrip(r.key).gain"
+                  @input="onTrackGain(r.key, $event)"
+                  @dblclick="resetTrackGain(r.key)"
                   :title="`Volume ${Math.round(trackStrip(r.key).gain * 100)}% (double-click to reset)`"
                 />
               </div>
             </template>
           </div>
           <div v-if="!rows.length" class="empty">
-            {{ catalog?.days.length ? 'No speech in this range.' : 'No recordings yet.' }}
+            {{ pending.length ? 'Loading…' : catalog?.days.length ? 'No speech in this range.' : 'No recordings yet.' }}
           </div>
         </div>
       </div>
       <div class="lanes" ref="lanesBox">
-        <canvas
-          ref="ruler"
-          class="ruler"
-          @pointerdown="(e) => onPointerDown(e, 'ruler')"
-          @pointermove="onPointerMove"
-          @pointerup="onPointerUp"
-          @wheel="(e: WheelEvent) => onWheel(e, 'ruler')"
-          title="Wheel: zoom · drag: select · click: move playhead"
-        />
-        <canvas
-          ref="lanes"
-          @pointerdown="(e) => onPointerDown(e, 'lanes')"
-          @pointermove="onPointerMove"
-          @pointerup="onPointerUp"
-          @pointerleave="tooltip = null"
-          @dblclick="onDblClick"
-          @wheel="(e: WheelEvent) => onWheel(e, 'lanes')"
-          @auxclick.prevent
-        />
+        <div class="stack">
+          <canvas
+            ref="ruler"
+            class="ruler"
+            @pointerdown="(e) => onPointerDown(e, 'ruler')"
+            @pointermove="onPointerMove"
+            @pointerup="onPointerUp"
+            @wheel="(e: WheelEvent) => onWheel(e, 'ruler')"
+            title="Wheel: zoom · drag: select · click: move playhead"
+          />
+          <canvas ref="rulerTop" class="over" />
+        </div>
+        <div class="stack">
+          <canvas
+            ref="lanes"
+            @pointerdown="(e) => onPointerDown(e, 'lanes')"
+            @pointermove="onPointerMove"
+            @pointerup="onPointerUp"
+            @pointerleave="tooltip = null"
+            @dblclick="onDblClick"
+            @wheel="(e: WheelEvent) => onWheel(e, 'lanes')"
+            @auxclick.prevent
+          />
+          <canvas ref="lanesTop" class="over" />
+        </div>
       </div>
     </div>
     <div v-if="tooltip" class="tooltip" :style="{ left: `${tooltip.x}px`, top: `${tooltip.y}px` }">
@@ -676,8 +975,21 @@ watch(() => JSON.stringify(ui.mix) + ui.hiddenChannels.size + ui.hiddenSpeakers.
   border-bottom: 1px solid var(--line);
   cursor: pointer;
 }
-.overview canvas {
+.stack {
+  position: relative;
   display: block;
+}
+.stack > canvas {
+  display: block;
+}
+.stack > canvas.over {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+.lanes .stack {
+  flex: none;
 }
 .body {
   flex: 1;

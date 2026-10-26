@@ -136,9 +136,12 @@ export function addDays(ms: number, n: number): number {
 }
 
 /** Golden-angle hue spread so neighbouring ids get distinct colors. */
+export function speakerHue(id: number): string {
+  return ((id * 137.508 + 200) % 360).toFixed(0);
+}
+
 export function speakerColor(id: number, alpha = 1): string {
-  const h = (id * 137.508 + 200) % 360;
-  return `hsla(${h.toFixed(0)}, 70%, 62%, ${alpha})`;
+  return `hsla(${speakerHue(id)}, 70%, 62%, ${alpha})`;
 }
 
 export function channelColor(id: number, alpha = 1): string {

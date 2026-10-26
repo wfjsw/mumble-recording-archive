@@ -1,4 +1,4 @@
-import { computed, reactive, ref, shallowRef } from 'vue';
+import { computed, reactive, ref, shallowRef, watch } from 'vue';
 import {
   fetchMeta,
   LogReader,
@@ -139,6 +139,33 @@ export const speakerName = (id: number) => speakers.value.get(id)?.name ?? `#${i
 
 // ---------- published data ----------
 
+/** Resolution of the coarse per-day bitmaps used when zoomed out. */
+export const BIT_MS = 60_000;
+
+/**
+ * A day's speech and presence at one-bit-per-minute, per track and per channel.
+ * Zoomed-out views draw from these instead of walking every segment: a month of
+ * dense speech is millions of clips but only a few million bits.
+ */
+export interface BitDay {
+  from: number;
+  to: number;
+  minutes: number;
+  speech: Map<string, Uint8Array>;
+  presence: Map<string, Uint8Array>;
+  byChannel: Map<number, Uint8Array>;
+  /** Channel -> speakers heard in it, for list building. */
+  tracks: Map<number, Set<number>>;
+  /** Any channel, for the overview at coarse zoom. */
+  all: Uint8Array;
+  /** Speech ms per minute summed over all channels: how much voice, not just whether. */
+  weight: Float32Array;
+  /** Minutes with speech per track / channel / speaker, for whole-day totals. */
+  trackMinutes: Map<string, number>;
+  channelMinutes: Map<number, number>;
+  speakerMinutes: Map<number, number>;
+}
+
 /** One loaded day log, applied incrementally. */
 interface DayData {
   day: string;
@@ -153,6 +180,8 @@ interface DayData {
   uptime: Map<number, { startMs: number; endMs: number | null }>;
   speakers: Map<number, Speaker>;
   channels: Map<number, Channel>;
+  /** Coarse bitmaps, rebuilt whenever the log grows. */
+  bits: BitDay | null;
   /** Poll again on the next refresh (open day, or changed after we read it). */
   stale: boolean;
 }
@@ -238,6 +267,175 @@ async function pollChannels(m: Meta): Promise<number> {
     channelsReader = new LogReader(`channels.${next}.log`);
     liveChannels.clear();
   }
+}
+
+// ---------- coarse bitmaps ----------
+
+const blank = (minutes: number) => new Uint8Array(((minutes + 7) >> 3) || 1);
+
+function pop8(v: number) {
+  v -= (v >> 1) & 0x55;
+  v = (v & 0x33) + ((v >> 2) & 0x33);
+  return (v + (v >> 4)) & 0x0f;
+}
+
+function popArr(arr: Uint8Array): number {
+  let n = 0;
+  for (let i = 0; i < arr.length; i++) n += pop8(arr[i]);
+  return n;
+}
+
+/** Set every bit covering [a, b) (whole bytes at a time). */
+function setBits(arr: Uint8Array, minutes: number, from: number, a: number, b: number) {
+  let i = Math.floor((a - from) / BIT_MS);
+  let j = Math.ceil((b - from) / BIT_MS) - 1;
+  if (i < 0) i = 0;
+  if (j > minutes - 1) j = minutes - 1;
+  if (j < i) return;
+  while (i <= j && (i & 7)) {
+    arr[i >> 3] |= 1 << (i & 7);
+    i++;
+  }
+  const endByte = (j + 1) >> 3;
+  if (endByte > i >> 3) arr.fill(0xff, i >> 3, endByte);
+  i = Math.max(i, endByte << 3);
+  while (i <= j) {
+    arr[i >> 3] |= 1 << (i & 7);
+    i++;
+  }
+}
+
+function buildBits(d: DayData) {
+  const minutes = Math.max(1, Math.ceil((d.to - d.from) / BIT_MS));
+  const b: BitDay = {
+    from: d.from,
+    to: d.to,
+    minutes,
+    speech: new Map(),
+    presence: new Map(),
+    byChannel: new Map(),
+    tracks: new Map(),
+    all: blank(minutes),
+    weight: new Float32Array(minutes),
+    trackMinutes: new Map(),
+    channelMinutes: new Map(),
+    speakerMinutes: new Map(),
+  };
+  for (const s of d.segments) {
+    const a = Math.max(s.startMs, d.from);
+    const z = Math.min(s.endMs, d.to);
+    if (z <= a) continue;
+    const k = trackKey(s.channelId, s.speakerId);
+    let arr = b.speech.get(k);
+    if (!arr) b.speech.set(k, (arr = blank(minutes)));
+    setBits(arr, minutes, d.from, a, z);
+    let ch = b.byChannel.get(s.channelId);
+    if (!ch) b.byChannel.set(s.channelId, (ch = blank(minutes)));
+    setBits(ch, minutes, d.from, a, z);
+    setBits(b.all, minutes, d.from, a, z);
+    // total speech time per minute (all channels): the overview's density
+    let mi = Math.max(0, Math.floor((a - d.from) / BIT_MS));
+    const mj = Math.min(minutes - 1, Math.ceil((z - d.from) / BIT_MS) - 1);
+    for (let m = mi; m <= mj; m++) {
+      const ms = Math.max(0, Math.min(z, d.from + (m + 1) * BIT_MS) - Math.max(a, d.from + m * BIT_MS));
+      b.weight[m] += ms;
+    }
+    let sps = b.tracks.get(s.channelId);
+    if (!sps) b.tracks.set(s.channelId, (sps = new Set()));
+    sps.add(s.speakerId);
+  }
+  for (const p of d.presence.values()) {
+    const a = Math.max(p.startMs, d.from);
+    const z = Math.min(p.endMs ?? d.to, d.to);
+    if (z <= a) continue;
+    const k = trackKey(p.channelId, p.speakerId);
+    let arr = b.presence.get(k);
+    if (!arr) b.presence.set(k, (arr = blank(minutes)));
+    setBits(arr, minutes, d.from, a, z);
+  }
+  // Totals for whole-day scopes (the sidebars), so they never scan bits.
+  for (const [k, arr] of b.speech) {
+    const n = popArr(arr);
+    b.trackMinutes.set(k, n);
+    const sp = Number(k.slice(k.indexOf(':') + 1));
+    b.speakerMinutes.set(sp, (b.speakerMinutes.get(sp) ?? 0) + n);
+  }
+  for (const [ch, arr] of b.byChannel) b.channelMinutes.set(ch, popArr(arr));
+  d.bits = b;
+}
+
+/** Any bit set in [a, b). */
+export function anyBit(arr: Uint8Array | undefined, day: BitDay, a: number, b: number): boolean {
+  if (!arr) return false;
+  let i = Math.floor((a - day.from) / BIT_MS);
+  let j = Math.ceil((b - day.from) / BIT_MS) - 1;
+  if (i < 0) i = 0;
+  if (j > day.minutes - 1) j = day.minutes - 1;
+  if (j < i) return false;
+  while (i <= j) {
+    if ((i & 7) === 0 && i + 8 <= j + 1) {
+      if (arr[i >> 3]) return true;
+      i += 8;
+    } else {
+      if (arr[i >> 3] & (1 << (i & 7))) return true;
+      i++;
+    }
+  }
+  return false;
+}
+
+/** Total speech ms (all channels) in [a, b). */
+export function weightIn(d: BitDay, a: number, b: number): number {
+  let i = Math.floor((a - d.from) / BIT_MS);
+  let j = Math.ceil((b - d.from) / BIT_MS) - 1;
+  if (i < 0) i = 0;
+  if (j > d.minutes - 1) j = d.minutes - 1;
+  let n = 0;
+  for (let m = i; m <= j; m++) n += d.weight[m];
+  return n;
+}
+
+/** Number of set bits (minutes with activity) in [a, b). */
+export function countBits(arr: Uint8Array, d: BitDay, a: number, b: number): number {
+  let i = Math.floor((a - d.from) / BIT_MS);
+  let j = Math.ceil((b - d.from) / BIT_MS) - 1;
+  if (i < 0) i = 0;
+  if (j > d.minutes - 1) j = d.minutes - 1;
+  if (j < i) return 0;
+  let n = 0;
+  while (i <= j && (i & 7)) {
+    if (arr[i >> 3] & (1 << (i & 7))) n++;
+    i++;
+  }
+  const endByte = (j + 1) >> 3;
+  for (let k = i >> 3; k < endByte; k++) n += pop8(arr[k]);
+  i = Math.max(i, endByte << 3);
+  while (i <= j) {
+    if (arr[i >> 3] & (1 << (i & 7))) n++;
+    i++;
+  }
+  return n;
+}
+
+/** Coarse bitmaps of the loaded days overlapping [from, to). */
+export function bitDaysIn(from: number, to: number): BitDay[] {
+  const out: BitDay[] = [];
+  for (const d of loadedDays(from, to)) if (d.bits) out.push(d.bits);
+  return out;
+}
+
+/** Channels with speech in [from, to) and the speakers heard in them. */
+export function activeTracks(from: number, to: number): Map<number, Set<number>> {
+  const out = new Map<number, Set<number>>();
+  for (const d of loadedDays(from, to)) {
+    if (!d.bits) continue;
+    for (const [ch, sps] of d.bits.tracks) {
+      let set = out.get(ch);
+      if (!set) out.set(ch, (set = new Set()));
+      for (const s of sps) set.add(s);
+    }
+  }
+  return out;
 }
 
 function insertSeg(d: DayData, s: Seg) {
@@ -327,10 +525,31 @@ function applyDayLog(d: DayData, recs: Rec[]) {
   }
 }
 
+/** Bumped whenever a day log starts or finishes loading. */
+export const loadingVersion = ref(0);
+
+export interface PendingDay {
+  day: string;
+  from: number;
+  to: number;
+}
+
+/**
+ * Days the catalog says have data in [from, to) whose log is not loaded yet.
+ * Lets the timeline say "loading" instead of looking empty.
+ */
+export function pendingIn(from: number, to: number): PendingDay[] {
+  void loadingVersion.value;
+  const out: PendingDay[] = [];
+  for (const e of entriesIn(from, to)) if (!days.has(e.day)) out.push({ day: e.day, from: e.from, to: e.to });
+  return out;
+}
+
 /** Returns the number of records read. */
 async function pollDay(d: DayData): Promise<number> {
   const recs = await d.reader.poll();
   applyDayLog(d, recs);
+  if (recs.length || !d.bits) buildBits(d);
   // Today (or a day still waiting for its totals) keeps changing.
   d.stale = !dayEntries.get(d.day)?.summary || d.to > Date.now();
   return recs.length;
@@ -422,6 +641,7 @@ function loadDay(day: string): Promise<void> {
     uptime: new Map(),
     speakers: new Map(),
     channels: new Map(),
+    bits: null,
     stale: true,
   };
   const p = pollDay(d)
@@ -431,8 +651,12 @@ function loadDay(day: string): Promise<void> {
       dataVersion.value++;
     })
     .catch((err) => console.warn('day log', day, err))
-    .finally(() => loadingDays.delete(day));
+    .finally(() => {
+      loadingDays.delete(day);
+      loadingVersion.value++;
+    });
   loadingDays.set(day, p);
+  loadingVersion.value++;
   return p;
 }
 
@@ -447,8 +671,24 @@ function loadedDays(from: number, to: number): DayData[] {
   return out.sort((a, b) => a.from - b.from);
 }
 
+/**
+ * One-entry cache for the last window asked for. The editor, both sidebars and
+ * the playback engine all query overlapping ranges in the same tick, and at a
+ * day's zoom that is hundreds of thousands of segments: never scan twice.
+ * Callers must treat the result as read-only.
+ */
+let segCache: { key: string; value: Seg[] } | null = null;
+
 /** Loaded segments overlapping [from, to), ordered by start. */
 export function segmentsIn(from: number, to: number): Seg[] {
+  const key = `${from}:${to}:${dataVersion.value}`;
+  if (segCache?.key === key) return segCache.value;
+  const value = scanSegments(from, to);
+  segCache = { key, value };
+  return value;
+}
+
+function scanSegments(from: number, to: number): Seg[] {
   const out: Seg[] = [];
   for (const d of loadedDays(from, to)) {
     const s = d.segments;
@@ -564,13 +804,43 @@ export const catalog = computed(() => {
 
 export const trackKey = (channelId: number, speakerId: number) => `${channelId}:${speakerId}`;
 
+const DEFAULT_STRIP: Strip = Object.freeze({ mute: false, solo: false, gain: 1 });
+
+/**
+ * Mixer strips are only created when the user actually changes one. Reading
+ * must not materialise them: the editor looks strips up while drawing, and a
+ * record per track ever displayed would grow without bound.
+ */
 export function trackStrip(key: string): Strip {
-  return (ui.mix.tracks[key] ??= { mute: false, solo: false, gain: 1 });
+  return ui.mix.tracks[key] ?? DEFAULT_STRIP;
 }
 
 export function channelStrip(id: number): Strip {
-  return (ui.mix.channels[id] ??= { mute: false, solo: false, gain: 1 });
+  return ui.mix.channels[id] ?? DEFAULT_STRIP;
 }
+
+export function setTrack(key: string, patch: Partial<Strip>) {
+  Object.assign((ui.mix.tracks[key] ??= { ...DEFAULT_STRIP }), patch);
+}
+
+export function setChannel(id: number, patch: Partial<Strip>) {
+  Object.assign((ui.mix.channels[id] ??= { ...DEFAULT_STRIP }), patch);
+}
+
+export function toggleTrack(key: string, field: 'mute' | 'solo') {
+  setTrack(key, { [field]: !trackStrip(key)[field] });
+}
+
+export function toggleChannel(id: number, field: 'mute' | 'solo') {
+  setChannel(id, { [field]: !channelStrip(id)[field] });
+}
+
+/**
+ * Bumped whenever the mixer changes. Drawing watches this instead of
+ * `JSON.stringify(ui.mix)`, which ran on every playhead tick.
+ */
+export const mixVersion = ref(0);
+watch(ui.mix, () => mixVersion.value++, { deep: true });
 
 export function isVisible(channelId: number, speakerId: number): boolean {
   return !ui.hiddenChannels.has(channelId) && !ui.hiddenSpeakers.has(speakerId);
@@ -594,14 +864,45 @@ export const isAudible = (s: Seg) => trackGain(s.channelId, s.speakerId) > 0;
 
 // ---------- activity in the current scope ----------
 
-/** Speech ms per channel / speaker among loaded segments in [from, to). */
-export function activity(from: number, to: number) {
+export interface Activity {
+  byChannel: Map<number, number>;
+  bySpeaker: Map<number, number>;
+}
+
+/** Cached like segmentsIn: the channel tree and the speaker list ask for the same window. */
+let activityCache: { key: string; value: Activity } | null = null;
+
+/**
+ * Speech ms per channel / speaker in [from, to). Whole-day ranges -- what the
+ * sidebars ask for -- are answered from the coarse bitmaps' minute totals, so
+ * a month-wide scope costs a few map merges instead of a segment scan.
+ */
+export function activity(from: number, to: number): Activity {
+  const key = `${from}:${to}:${dataVersion.value}`;
+  if (activityCache?.key === key) return activityCache.value;
+  const days = loadedDays(from, to);
   const byChannel = new Map<number, number>();
   const bySpeaker = new Map<number, number>();
-  for (const s of segmentsIn(from, to)) {
-    const d = Math.min(s.endMs, to) - Math.max(s.startMs, from);
-    byChannel.set(s.channelId, (byChannel.get(s.channelId) ?? 0) + d);
-    bySpeaker.set(s.speakerId, (bySpeaker.get(s.speakerId) ?? 0) + d);
+  for (const d of days) {
+    const b = d.bits;
+    if (!b) continue;
+    const whole = from <= b.from && to >= b.to;
+    for (const [ch, arr] of b.byChannel) {
+      const n = whole ? (b.channelMinutes.get(ch) ?? 0) : countBits(arr, b, from, to);
+      if (n) byChannel.set(ch, (byChannel.get(ch) ?? 0) + n * BIT_MS);
+    }
+    if (whole) {
+      for (const [sp, n] of b.speakerMinutes) bySpeaker.set(sp, (bySpeaker.get(sp) ?? 0) + n * BIT_MS);
+    } else {
+      for (const [k, arr] of b.speech) {
+        const n = countBits(arr, b, from, to);
+        if (!n) continue;
+        const sp = Number(k.slice(k.indexOf(':') + 1));
+        bySpeaker.set(sp, (bySpeaker.get(sp) ?? 0) + n * BIT_MS);
+      }
+    }
   }
-  return { byChannel, bySpeaker };
+  const value = { byChannel, bySpeaker };
+  activityCache = { key, value };
+  return value;
 }

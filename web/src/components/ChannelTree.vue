@@ -7,7 +7,7 @@
 //  - checkboxes act on whole subtrees, with a mixed state for partial filters
 import { computed, reactive, ref } from 'vue';
 import { scope } from '../rows';
-import { activity, dataVersion, subtree, tree, ui, type TreeNode } from '../state';
+import { activity, dataVersion, pendingIn, subtree, tree, ui, type TreeNode } from '../state';
 import { channelColor } from '../util';
 import VirtualList from './VirtualList.vue';
 
@@ -139,6 +139,9 @@ function setFocus(id: number | null) {
   focus.value = id;
 }
 
+/** Days known to hold speech that are not loaded yet. */
+const pending = computed(() => pendingIn(scope.value.from, scope.value.to).length);
+
 const shortDur = (ms: number) => (ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.max(1, Math.round(ms / 1000))}s`);
 const totalChannels = computed(() => tree.value.order.length);
 </script>
@@ -190,7 +193,7 @@ const totalChannels = computed(() => tree.value.order.length);
       </template>
     </VirtualList>
     <div class="empty" v-if="!items.length">
-      {{ query ? 'No matching channels.' : activeOnly ? 'No speech in the viewed day(s).' : 'No channels.' }}
+      {{ query ? 'No matching channels.' : pending ? 'Loading…' : activeOnly ? 'No speech in the viewed day(s).' : 'No channels.' }}
     </div>
   </div>
 </template>
